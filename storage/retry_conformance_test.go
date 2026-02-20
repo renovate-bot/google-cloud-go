@@ -563,28 +563,33 @@ var methods = map[string][]retryFunc{
 			}
 
 			// Download the test object using the MultiRangeDownloader.
-			mrr, err := c.Bucket(fs.bucket.Name).Object(objName).NewMultiRangeDownloader(ctx)
+			mrd, err := c.Bucket(fs.bucket.Name).Object(objName).NewMultiRangeDownloader(ctx)
 			if err != nil {
 				return err
 			}
-			buf := new(bytes.Buffer)
-			var err1 error
-			callback := func(x, y int64, err error) {
-				err1 = err
+			addCount := 50
+			results := make([]multiRangeDownloaderOutput, addCount)
+			for i := 0; i < addCount; i++ {
+				mrd.Add(&results[i].buf, 0, 3*MiB, func(x, y int64, err error) {
+					results[i].offset = x
+					results[i].limit = y
+					results[i].err = err
+				})
 			}
-			mrr.Add(buf, 0, 3*MiB, callback)
-			mrr.Wait()
-			if err1 != nil {
-				return err1
-			}
-			if got, want := len(buf.Bytes()), 3*MiB; got != want {
-				return fmt.Errorf("body length mismatch\ngot:\n%v\n\nwant:\n%v", got, want)
-			}
-			if got, want := buf.Bytes(), randomBytes3MiB; !bytes.Equal(got, want) {
-				return fmt.Errorf("body mismatch\ngot:\n%v\n\nwant:\n%v", got, want)
-			}
-			if err = mrr.Close(); err != nil {
+			mrd.Wait()
+			if err = mrd.Close(); err != nil {
 				return err
+			}
+			for i := 0; i < addCount; i++ {
+				if results[i].err != nil {
+					return results[i].err
+				}
+				if int64(results[i].buf.Len()) != 3*MiB {
+					return fmt.Errorf("body length mismatch\ngot:\n%v\n\nwant:\n%v", int64(results[i].buf.Len()), 3*MiB)
+				}
+				if !bytes.Equal(results[i].buf.Bytes(), randomBytes3MiB) {
+					return fmt.Errorf("body mismatch\ngot:\n%v\n\nwant:\n%v", results[i].buf.Bytes(), randomBytes3MiB)
+				}
 			}
 			return nil
 		},
