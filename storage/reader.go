@@ -154,8 +154,8 @@ func (o *ObjectHandle) NewRangeReader(ctx context.Context, offset, length int64)
 	return r, err
 }
 
-// mrdOption is an option for MultiRangeDownloader.
-type mrdOption interface {
+// MRDOption is an option for MultiRangeDownloader.
+type MRDOption interface {
 	apply(*newMultiRangeDownloaderParams)
 }
 
@@ -165,11 +165,11 @@ func (c minConnections) apply(params *newMultiRangeDownloaderParams) {
 	params.minConnections = int(c)
 }
 
-// withMinConnections returns an mrdOption which sets minimum connections
+// WithMinConnections returns an MRDOption which sets minimum connections
 // on the MRD to c. The call to NewMultiRangeDownloader will create one connection
 // and return with an MRD. The remaining connections will be created in the background
 // to avoid open latency.
-func withMinConnections(c int) mrdOption {
+func WithMinConnections(c int) MRDOption {
 	return minConnections(c)
 }
 
@@ -179,11 +179,11 @@ func (c maxConnections) apply(params *newMultiRangeDownloaderParams) {
 	params.maxConnections = int(c)
 }
 
-// withMaxConnections returns an mrdOption which sets maximum connections
+// WithMaxConnections returns an MRDOption which sets maximum connections
 // on the MRD to c. The number of connections will not exceed this number.
 // The connections will range between minimum connections and maximum connections
 // based on the load.
-func withMaxConnections(c int) mrdOption {
+func WithMaxConnections(c int) MRDOption {
 	return maxConnections(c)
 }
 
@@ -193,14 +193,14 @@ func (c targetPendingRanges) apply(params *newMultiRangeDownloaderParams) {
 	params.targetPendingRanges = int(c)
 }
 
-// withTargetPendingRanges returns an mrdOption which sets target pending
+// WithTargetPendingRanges returns an MRDOption which sets target pending
 // ranges on the MRD to c. If number of connections in the MRD is less than
 // maximum connections, MRD will trigger creation of a new connection when
 // pending ranges on all existing streams exceed c.
 //
 // Note: A new connection can be triggered by either the pending byte threshold
-// (withTargetPendingBytes) or the pending range threshold (withTargetPendingRanges).
-func withTargetPendingRanges(c int) mrdOption {
+// (WithTargetPendingBytes) or the pending range threshold (WithTargetPendingRanges).
+func WithTargetPendingRanges(c int) MRDOption {
 	return targetPendingRanges(c)
 }
 
@@ -210,14 +210,14 @@ func (c targetPendingBytes) apply(params *newMultiRangeDownloaderParams) {
 	params.targetPendingBytes = int(c)
 }
 
-// withTargetPendingBytes returns an mrdOption that sets target pending
+// WithTargetPendingBytes returns an MRDOption that sets target pending
 // bytes on the MRD to c. If number of connections in the MRD is less than
 // maximum connections, MRD will trigger creation of a new connection when
 // outstanding bytes on all existing streams exceed c.
 //
 // Note: A new connection can be triggered by either the pending byte threshold
-// (withTargetPendingBytes) or the pending range threshold (withTargetPendingRanges).
-func withTargetPendingBytes(c int) mrdOption {
+// (WithTargetPendingBytes) or the pending range threshold (WithTargetPendingRanges).
+func WithTargetPendingBytes(c int) MRDOption {
 	return targetPendingBytes(c)
 }
 
@@ -231,7 +231,7 @@ func withTargetPendingBytes(c int) mrdOption {
 
 // NewMultiRangeDownloader creates a multi-range reader for an object.
 // Must be called on a gRPC client created using [NewGRPCClient].
-func (o *ObjectHandle) NewMultiRangeDownloader(ctx context.Context) (mrd *MultiRangeDownloader, err error) {
+func (o *ObjectHandle) NewMultiRangeDownloader(ctx context.Context, opts ...MRDOption) (mrd *MultiRangeDownloader, err error) {
 	// This span covers the life of the MRD. It is closed via the context
 	// in MultiRangeDownloader.Close.
 	var spanCtx context.Context
@@ -260,6 +260,10 @@ func (o *ObjectHandle) NewMultiRangeDownloader(ctx context.Context) (mrd *MultiR
 		gen:           o.gen,
 		object:        o.object,
 		handle:        &o.readHandle,
+	}
+	// Process configured options
+	for _, opt := range opts {
+		opt.apply(params)
 	}
 
 	// This call will return the *MultiRangeDownloader with the .impl field set.

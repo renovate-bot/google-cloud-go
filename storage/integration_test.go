@@ -455,10 +455,8 @@ func TestIntegration_MRDManyReads(t *testing.T) {
 				log.Printf("failed to delete test object: %v", err)
 			}
 		}()
-		reader, err := obj.NewMultiRangeDownloader(ctx)
+		reader, err := obj.NewMultiRangeDownloader(ctx, WithMinConnections(3))
 		manager := reader.impl.(*multiRangeDownloaderManager)
-		manager.params.minConnections = 3
-		manager.params.maxConnections = 3
 		if err != nil {
 			t.Fatalf("NewMultiRangeDownloader: %v", err)
 		}
@@ -658,14 +656,11 @@ func TestIntegration_MRDScaleUpConnections(t *testing.T) {
 				log.Printf("failed to delete test object: %v", err)
 			}
 		})
-		reader, err := obj.NewMultiRangeDownloader(ctx)
-		manager := reader.impl.(*multiRangeDownloaderManager)
-
-		manager.params.maxConnections = 3
+		maxConnections := 3
 		// Initializing targetPendingBytes to 1 to make sure manager
 		// definitely scales up with any load.
-		manager.params.targetPendingBytes = 1
-
+		reader, err := obj.NewMultiRangeDownloader(ctx, WithMaxConnections(maxConnections), WithTargetPendingBytes(1))
+		manager := reader.impl.(*multiRangeDownloaderManager)
 		if err != nil {
 			t.Fatalf("NewMultiRangeDownloader: %v", err)
 		}
@@ -709,8 +704,8 @@ func TestIntegration_MRDScaleUpConnections(t *testing.T) {
 		// Wait for all reads to complete.
 		reader.Wait()
 
-		if manager.streamIDCounter != manager.params.maxConnections {
-			t.Fatalf("Manager did not scale up to maxConnections; got %d, want %d", manager.streamIDCounter, manager.params.maxConnections)
+		if manager.streamIDCounter != maxConnections {
+			t.Fatalf("Manager did not scale up to maxConnections; got %d, want %d", manager.streamIDCounter, maxConnections)
 		}
 		if err = reader.Close(); err != nil {
 			t.Fatalf("Error while closing reader: %v", err)
