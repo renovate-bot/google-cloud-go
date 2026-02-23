@@ -18,7 +18,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
-	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1181,13 +1180,6 @@ func (et *emulatorTest) populateResources(ctx context.Context, c *Client, resour
 			et.resources.hmacKey = key
 		}
 	}
-}
-
-// Generates size random bytes.
-func generateRandomBytes(n int) []byte {
-	b := make([]byte, n)
-	_, _ = rand.Read(b)
-	return b
 }
 
 // Upload test object with given bytes.
