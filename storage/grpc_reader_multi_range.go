@@ -42,7 +42,7 @@ const (
 	// can be processed.
 	mrdAddInternalQueueMaxSize = 50000
 	defaultTargetPendingBytes  = 1 << 30 // 1 GiB
-	defaultTargetPendingRanges = 20000
+	defaultTargetPendingRanges = 500
 )
 
 // --- internalMultiRangeDownloader Interface ---
@@ -64,12 +64,17 @@ type streamPickerStrategy interface {
 	pick(streams map[int]*mrdStream) int
 }
 
-// minBytesPicker picks the stream with minimum outstanding bytes.
-type minBytesPicker struct{}
+// weightedPicker picks the stream with the minimum combined score of
+// pending ranges and pending bytes, normalized by their respective targets.
+type weightedPicker struct {
+	targetPendingRanges int
+	targetPendingBytes  int
+}
 
-func (m *minBytesPicker) pick(streams map[int]*mrdStream) int {
-	minBytes := int64(-1)
+func (p *weightedPicker) pick(streams map[int]*mrdStream) int {
+	minScore := -1.0
 	returnID := -1
+
 	for id, stream := range streams {
 		if stream.reconnecting || stream.session == nil {
 			continue
@@ -79,13 +84,18 @@ func (m *minBytesPicker) pick(streams map[int]*mrdStream) int {
 		if len(stream.session.reqC) >= cap(stream.session.reqC) {
 			continue
 		}
-		if minBytes == -1 || stream.totalRangeBytes < minBytes {
-			minBytes = stream.totalRangeBytes
+
+		// Calculate normalized score.
+		// Score = (PendingRanges / TargetRanges) + (PendingBytes / TargetBytes)
+		// Lower score is better (least loaded).
+		score := float64(stream.totalRanges)/float64(p.targetPendingRanges) +
+			float64(stream.totalRangeBytes)/float64(p.targetPendingBytes)
+
+		if returnID == -1 || score < minScore {
+			minScore = score
 			returnID = id
 		}
 	}
-	// If all channels are full or if all streams are reconnecting, returnID remains -1. The event
-	// loop will skip the send case and focus on processing responses until space becomes available.
 	return returnID
 }
 
@@ -158,7 +168,7 @@ func (c *grpcStorageClient) NewMultiRangeDownloader(ctx context.Context, params 
 		attrsReady:     make(chan struct{}),
 		spanCtx:        ctx,
 		streams:        make(map[int]*mrdStream),
-		streamPicker:   &minBytesPicker{},
+		streamPicker:   &weightedPicker{targetPendingRanges: params.targetPendingRanges, targetPendingBytes: params.targetPendingBytes},
 		unsentRequests: newRequestQueue(),
 		addStreams:     make(chan mrdCommand, mrdAddStreamsChannelSize),
 	}
@@ -232,10 +242,10 @@ func (m *newMultiRangeDownloaderParams) defaults() {
 	if m.maxConnections < m.minConnections {
 		m.maxConnections = m.minConnections
 	}
-	if m.targetPendingRanges == 0 {
+	if m.targetPendingRanges <= 0 {
 		m.targetPendingRanges = defaultTargetPendingRanges
 	}
-	if m.targetPendingBytes == 0 {
+	if m.targetPendingBytes <= 0 {
 		m.targetPendingBytes = defaultTargetPendingBytes
 	}
 }
@@ -312,10 +322,22 @@ func (c *reconnectStreamCmd) apply(ctx context.Context, m *multiRangeDownloaderM
 	m.handleReconnectStreamCmd(ctx, c)
 }
 
-type mrdAddStreamErrorCmd struct{}
+type mrdAddStreamErrorCmd struct {
+	err error
+}
 
 func (c *mrdAddStreamErrorCmd) apply(ctx context.Context, m *multiRangeDownloaderManager) {
 	m.streamCreating = false
+	if len(m.streams) == 0 {
+		var err error
+		if c.err != nil {
+			err = fmt.Errorf("no streams available. Last observed error: %w", c.err)
+		} else {
+			err = errors.New("no streams available")
+		}
+		m.setPermanentError(err)
+		m.failAllPending(m.getPermanentError())
+	}
 }
 
 // --- mrdSessionResult ---
@@ -330,7 +352,10 @@ type mrdSessionResult struct {
 	redirect *storagepb.BidiReadObjectRedirectedError
 }
 
-var errClosed = errors.New("downloader closed")
+var (
+	errClosed    = errors.New("downloader closed")
+	errNoStreams = errors.New("no streams available")
+)
 
 // --- multiRangeDownloaderManager ---
 // Manages main event loop for MRD commands and processing responses.
@@ -419,6 +444,9 @@ func (m *multiRangeDownloaderManager) close(err error) error {
 		return nil
 	case <-m.ctx.Done():
 		m.wg.Wait()
+		if m.getPermanentError() != nil {
+			return m.getPermanentError()
+		}
 		return m.ctx.Err()
 	}
 }
@@ -605,13 +633,17 @@ func (m *multiRangeDownloaderManager) addNewStream() {
 	m.streamIDCounter++
 	// Clone the spec within the event loop.
 	clonedSpec := proto.Clone(m.readSpec).(*storagepb.BidiReadObjectSpec)
+	if m.ctx.Err() != nil {
+		m.streamCreating = false
+		return
+	}
 	go func(id int, readSpec *storagepb.BidiReadObjectSpec) {
 		newSession, newSpec, err := m.createNewSession(id, readSpec, false)
 		if err != nil || newSession == nil {
-			// If we can't create a stream, just reset the flag so we can try again later.
-			// We don't want to kill the whole manager for a single failed dynamic stream.
+			// If we can't create a stream, the handler checks the health of
+			// manager and then decides to kill the manager.
 			select {
-			case m.addStreams <- &mrdAddStreamErrorCmd{}:
+			case m.addStreams <- &mrdAddStreamErrorCmd{err: err}:
 			case <-m.ctx.Done():
 				if newSession != nil {
 					newSession.Shutdown()
@@ -794,7 +826,6 @@ func (m *multiRangeDownloaderManager) handleCloseCmd(ctx context.Context, cmd *m
 		err = cmd.err
 	} else {
 		err = errClosed
-
 	}
 	m.setPermanentError(err)
 	m.cancel()
@@ -831,12 +862,12 @@ func (m *multiRangeDownloaderManager) handleReconnectStreamCmd(ctx context.Conte
 	stream.reconnecting = false
 
 	if cmd.err != nil {
-		if !errors.Is(cmd.err, context.Canceled) && !errors.Is(cmd.err, errClosed) {
-			m.setPermanentError(cmd.err)
-		} else if m.getPermanentError() == nil {
-			m.setPermanentError(errClosed)
+		m.failStream(stream, cmd.err)
+		if len(m.streams) == 0 && !m.streamCreating {
+			err := fmt.Errorf("no streams available. Last observed error: %w", cmd.err)
+			m.setPermanentError(err)
+			m.failAllPending(m.getPermanentError())
 		}
-		m.failAllPending(m.getPermanentError())
 		return
 	}
 
@@ -993,7 +1024,6 @@ func (m *multiRangeDownloaderManager) handleStreamEnd(result mrdSessionResult, s
 		stream.session = nil
 	}
 	err := result.err
-	pErr := m.getPermanentError()
 	if result.redirect != nil {
 		m.readSpec.RoutingToken = result.redirect.RoutingToken
 		m.readSpec.ReadHandle = result.redirect.ReadHandle
@@ -1001,14 +1031,12 @@ func (m *multiRangeDownloaderManager) handleStreamEnd(result mrdSessionResult, s
 	} else if m.settings.retry != nil && m.settings.retry.runShouldRetry(err) {
 		m.ensureSession(m.ctx, stream)
 	} else {
-		if !errors.Is(err, context.Canceled) && !errors.Is(err, errClosed) {
+		m.failStream(stream, err)
+		if len(m.streams) == 0 && !m.streamCreating {
+			err := fmt.Errorf("no streams available. Last observed error: %w", err)
 			m.setPermanentError(err)
-			pErr = err
-		} else if pErr == nil {
-			m.setPermanentError(errClosed)
-			pErr = errClosed
+			m.failAllPending(m.getPermanentError())
 		}
-		m.failAllPending(pErr)
 	}
 }
 
@@ -1024,6 +1052,22 @@ func (m *multiRangeDownloaderManager) failRange(mrdStream *mrdStream, req *range
 		}
 	}
 	m.runCallback(req.origOffset, req.bytesWritten, err, req.callback)
+}
+
+func (m *multiRangeDownloaderManager) failStream(mrdStream *mrdStream, err error) {
+	totalBytes := int64(0)
+	pendingRanges := 0
+	for _, req := range mrdStream.pendingRanges {
+		if !req.completed {
+			totalBytes += req.length - req.bytesWritten
+			pendingRanges++
+			req.completed = true
+			m.runCallback(req.origOffset, req.bytesWritten, err, req.callback)
+		}
+	}
+	mrdStream.updateCapacity(m, -pendingRanges, -totalBytes)
+	mrdStream.pendingRanges = make(map[int64]*rangeRequest)
+	delete(m.streams, mrdStream.id)
 }
 
 func (m *multiRangeDownloaderManager) failAllPending(err error) {

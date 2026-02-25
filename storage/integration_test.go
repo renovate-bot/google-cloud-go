@@ -729,6 +729,99 @@ func TestIntegration_MRDScaleUpConnections(t *testing.T) {
 	})
 }
 
+func TestIntegration_MRDStreamFailureSurvival(t *testing.T) {
+	multiTransportTest(skipAllButZonal(context.Background(), "Bidi Read API test"), t, func(t *testing.T, ctx context.Context, bucket string, _ string, client *Client) {
+		content := make([]byte, 1<<20)
+		rand.New(rand.NewSource(0)).Read(content)
+		objName := "mrd-survival"
+		obj := client.Bucket(bucket).Object(objName)
+		if err := writeObject(ctx, obj, "text/plain", content); err != nil {
+			t.Fatal(err)
+		}
+		defer obj.Delete(ctx)
+
+		tests := []struct {
+			name           string
+			minConnections int
+			WantMrdError   bool
+		}{
+			{
+				name:           "multi stream",
+				minConnections: 2,
+				WantMrdError:   false,
+			},
+			{
+				name:           "single stream",
+				minConnections: 1,
+				WantMrdError:   true,
+			},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+
+				reader, err := obj.NewMultiRangeDownloader(ctx, WithMinConnections(tc.minConnections))
+				if err != nil {
+					t.Fatalf("NewMultiRangeDownloader: %v", err)
+				}
+				type rangeRes struct {
+					buf       bytes.Buffer
+					offset    int64
+					limit     int64
+					gotOffset int64
+					gotLimit  int64
+					err       error
+				}
+				results := make([]*rangeRes, 1000)
+				var wg sync.WaitGroup
+				wg.Add(len(results))
+
+				for i := 0; i < 1000; i++ {
+					offset, limit := 0, 100
+					// Inject an out of range error.
+					if i == 100 {
+						offset = 1 << 30
+					}
+					r := &rangeRes{offset: int64(offset), limit: int64(limit)}
+					results[i] = r
+					reader.Add(&r.buf, results[i].offset, results[i].limit, func(o int64, l int64, err error) {
+						r.err = err
+						r.gotOffset = o
+						r.gotLimit = l
+						wg.Done()
+					})
+				}
+				wg.Wait()
+				reader.Wait()
+				mrdErr := reader.Close()
+				// Manager should still be alive incase of multistream.
+				if (mrdErr != nil) != tc.WantMrdError {
+					t.Fatalf("WantMrdError: got %v, want %v", mrdErr != nil, tc.WantMrdError)
+				}
+				if tc.WantMrdError {
+					return
+				}
+				for id, res := range results {
+					if res.err != nil && status.Code(res.err) != codes.OutOfRange {
+						t.Errorf("Range %d error mismatch: want %v got %v", id, status.Code(res.err), codes.OutOfRange)
+						continue
+					} else if res.err != nil {
+						continue
+					}
+					if res.gotOffset != res.offset || res.gotLimit != res.limit {
+						t.Errorf("Range %d: got callback offset/limit (%d, %d), want (%d, %d)",
+							id, res.gotOffset, res.gotLimit, res.offset, res.limit)
+					}
+					want := content[res.offset : res.offset+res.limit]
+					if !bytes.Equal(res.buf.Bytes(), want) {
+						t.Errorf("Data mismatch in range %d: got %d bytes, want %d bytes",
+							id, res.buf.Len(), len(want))
+					}
+				}
+			})
+		}
+	})
+}
+
 // TestIntegration_ReadSameFileConcurrentlyUsingMultiRangeDownloader tests for potential deadlocks
 // or race conditions when multiple goroutines call Add() concurrently on the same MRD multiple times.
 func TestIntegration_ReadSameFileConcurrentlyUsingMultiRangeDownloader(t *testing.T) {
