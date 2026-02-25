@@ -105,6 +105,20 @@ func WithMeterProvider(mp metric.MeterProvider) BigtableChannelPoolOption {
 	}
 }
 
+// WithDirectAccessDialer provides the dialer for direct access
+func WithDirectAccessDialer(directAccessDialer func() (*BigtableConn, error)) BigtableChannelPoolOption {
+	return func(p *BigtableChannelPool) {
+		p.directAccessDialer = directAccessDialer
+	}
+}
+
+// WithDirectAccessFeatureFlagsMetadata provides the feature flags required for DirectAccess
+func WithDirectAccessFeatureFlagsMetadata(directAccessFeatureFlagsMD metadata.MD) BigtableChannelPoolOption {
+	return func(p *BigtableChannelPool) {
+		p.directAccessFeatureFlagsMD = directAccessFeatureFlagsMD
+	}
+}
+
 // WithLogger provides the logger for logging events
 func WithLogger(logger *log.Logger) BigtableChannelPoolOption {
 	return func(p *BigtableChannelPool) {
@@ -328,6 +342,12 @@ type BigtableChannelPool struct {
 	// configs
 	metricsConfig btopt.MetricsReporterConfig
 
+	directAccessFeatureFlagsMD metadata.MD
+	directAccessDialer         func() (*BigtableConn, error)
+
+	// Add the cached gauge instrument
+	daEligibleGauge metric.Int64Gauge
+
 	// background monitors
 	monitors []Monitor
 }
@@ -371,12 +391,43 @@ func NewBigtableChannelPool(ctx context.Context, connPoolSize int, strategy btop
 		opt(pool)
 	}
 
+	// make the da guage lifetime, optional
+	if pool.meterProvider != nil {
+		meter := pool.meterProvider.Meter(clientMeterName)
+		var err error
+		pool.daEligibleGauge, err = meter.Int64Gauge(
+			"direct_access/compatible",
+			metric.WithDescription("Reports 1 if the environment is eligible for DirectPath, 0 otherwise. Based on a connection attempt at startup."),
+			metric.WithUnit("1"),
+		)
+		if err != nil {
+			btopt.Debugf(pool.logger, "bigtable_connpool: failed to create direct_access/compatible metric: %v", err)
+		}
+	}
+
+	// All standard dialers and feature flags
+	factoryDial := dial
+	factoryFeatureFlagsMD := pool.featureFlagsMD
+
+	var firstConn *BigtableConn
+
+	if pool.directAccessDialer != nil {
+		var isDirectAccess bool
+		if firstConn, isDirectAccess = pool.checkIfDirectAccessIsAvailable(); isDirectAccess {
+			btopt.Debugf(pool.logger, "bigtable_connpool: Direct Access is available. Using Direct Access now.")
+			factoryDial = pool.directAccessDialer
+			factoryFeatureFlagsMD = pool.directAccessFeatureFlagsMD
+		} else {
+			btopt.Debugf(pool.logger, "bigtable_connpool: Direct Access is not available. Falling back to cloud path.")
+		}
+	}
+
 	// Initialize the connectionFactory
 	pool.factory = &connectionFactory{
-		dial:           dial,
+		dial:           factoryDial,
 		instanceName:   pool.instanceName,
 		appProfile:     pool.appProfile,
-		featureFlagsMD: pool.featureFlagsMD,
+		featureFlagsMD: factoryFeatureFlagsMD,
 		logger:         pool.logger,
 	}
 
@@ -405,7 +456,15 @@ func NewBigtableChannelPool(ctx context.Context, connPoolSize int, strategy btop
 			break
 		}
 
-		entry, err := pool.factory.newEntry(ctx)
+		var entry *connEntry
+		var err error
+
+		if i == 0 && firstConn != nil {
+			entry = &connEntry{conn: firstConn}
+		} else {
+			entry, err = pool.factory.newEntry(ctx)
+		}
+
 		if err != nil {
 			exitSignal = err
 			break
@@ -447,6 +506,47 @@ func NewBigtableChannelPool(ctx context.Context, connPoolSize int, strategy btop
 	pool.recordClientStartUp(clientCreationTimestamp, transportType)
 
 	return pool, nil
+}
+
+// checkIfDirectAccessIsAvailable attempts to create a single connection using the directAccessDialer,
+// primes it, and checks if direct access was successful
+func (p *BigtableChannelPool) checkIfDirectAccessIsAvailable() (*BigtableConn, bool) {
+	conn, err := p.directAccessDialer()
+	if err != nil {
+		btopt.Debugf(p.logger, "bigtable_connpool: Direct Access failed: %v", err)
+		return nil, false
+	}
+
+	err = conn.Prime(p.poolCtx, p.instanceName, p.appProfile, p.directAccessFeatureFlagsMD)
+	if err != nil {
+		btopt.Debugf(p.logger, "bigtable_connpool: Prime() failed during Direct Access check: %v", err)
+		conn.Close()
+		p.reportDirectAccessMetric(false)
+		return nil, false
+	}
+
+	if conn.isALTSConn.Load() {
+		p.reportDirectAccessMetric(true)
+		return conn, true
+	}
+
+	// If not ALTS, discard
+	conn.Close()
+	p.reportDirectAccessMetric(false)
+	return nil, false
+}
+
+// reportDirectAccessMetric records the direct_access/compatible metric.
+func (p *BigtableChannelPool) reportDirectAccessMetric(isEligible bool) {
+	// Check if the instrument was successfully created during pool initialization
+	if p.daEligibleGauge == nil {
+		return
+	}
+	val := int64(0)
+	if isEligible {
+		val = 1
+	}
+	p.daEligibleGauge.Record(p.poolCtx, val)
 }
 
 func (p *BigtableChannelPool) recordClientStartUp(clientCreationTimestamp time.Time, transportType string) {
