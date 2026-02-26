@@ -801,14 +801,15 @@ func TestIntegration_MRDStreamFailureSurvival(t *testing.T) {
 					return
 				}
 				for id, res := range results {
-					if res.err != nil && status.Code(res.err) != codes.OutOfRange {
-						t.Errorf("Range %d error mismatch: want %v got %v", id, status.Code(res.err), codes.OutOfRange)
-						continue
+					// We could see an EOF if receive loop sees context error before receiviing error
+					// from stream with stream.RecvMsg().
+					if res.err != nil && (status.Code(res.err) != codes.OutOfRange || err != io.EOF) {
+						t.Fatalf("Range %d error mismatch. want: (%v or %v); got code: %v error: %v", id, io.EOF, codes.OutOfRange, status.Code(res.err), res.err)
 					} else if res.err != nil {
 						continue
 					}
 					if res.gotOffset != res.offset || res.gotLimit != res.limit {
-						t.Errorf("Range %d: got callback offset/limit (%d, %d), want (%d, %d)",
+						t.Fatalf("Range %d: got callback offset/limit (%d, %d), want (%d, %d)",
 							id, res.gotOffset, res.gotLimit, res.offset, res.limit)
 					}
 					want := content[res.offset : res.offset+res.limit]
