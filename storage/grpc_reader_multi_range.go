@@ -1196,7 +1196,9 @@ func (s *bidiReadStreamSession) sendLoop() {
 			}
 			if err := s.stream.Send(req); err != nil {
 				s.setError(err)
-				s.cancel()
+				if err != io.EOF {
+					s.cancel()
+				}
 				return
 			}
 		case <-s.ctx.Done():
@@ -1244,6 +1246,7 @@ func (s *bidiReadStreamSession) receiveLoop() {
 			return
 		}
 		if s.managerCtx.Err() != nil {
+			databufs.Free()
 			return
 		}
 		select {
@@ -1264,12 +1267,14 @@ func (s *bidiReadStreamSession) receiveLoop() {
 			// to make sure we do not send on a closed respC channel
 			// during normal MRD close.
 			if s.managerCtx.Err() != nil {
+				databufs.Free()
 				return
 			}
 			select {
 			case s.respC <- mrdSessionResult{id: s.id, session: s, err: err}:
 			case <-s.managerCtx.Done():
 			}
+			databufs.Free()
 			return
 		}
 	}
