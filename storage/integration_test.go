@@ -803,7 +803,7 @@ func TestIntegration_MRDStreamFailureSurvival(t *testing.T) {
 				for id, res := range results {
 					// We could see an EOF if receive loop sees context error before receiviing error
 					// from stream with stream.RecvMsg().
-					if res.err != nil && (status.Code(res.err) != codes.OutOfRange || err != io.EOF) {
+					if res.err != nil && (status.Code(res.err) != codes.OutOfRange && res.err != io.EOF) {
 						t.Fatalf("Range %d error mismatch. want: (%v or %v); got code: %v error: %v", id, io.EOF, codes.OutOfRange, status.Code(res.err), res.err)
 					} else if res.err != nil {
 						continue
