@@ -4138,7 +4138,6 @@ func TestIntegration_WriterAppendTakeover(t *testing.T) {
 }
 
 func TestIntegration_WriterAppendEdgeCases(t *testing.T) {
-	t.Skip("persistent failures - https://github.com/googleapis/google-cloud-go/issues/13545")
 	ctx := skipAllButZonal(context.Background(), "ZB test")
 	multiTransportTest(ctx, t, func(t *testing.T, ctx context.Context, bucket, _ string, client *Client) {
 		h := testHelper{t}
@@ -4183,8 +4182,11 @@ func TestIntegration_WriterAppendEdgeCases(t *testing.T) {
 
 		// Expect FAILED_PRECONDITION or ABORTED error when writing to orginal Writer.
 		_, err = w.Write(randomBytes3MiB)
+		if err == nil {
+			_, err = w.Flush()
+		}
 		if code := status.Code(err); !(code == codes.FailedPrecondition || code == codes.Aborted) {
-			t.Fatalf("w.Write: got error %v, want FailedPrecondition or Aborted", err)
+			t.Fatalf("w.Write or w.Flush: got error %v, want FailedPrecondition or Aborted", err)
 		}
 
 		// Another NewWriter to the unfinalized object should be able to
@@ -4198,8 +4200,8 @@ func TestIntegration_WriterAppendEdgeCases(t *testing.T) {
 			t.Fatalf("w2.Close: %v", err)
 		}
 
-		// If we add yet another takeover writer to finalize and delete the object,
-		// tw should return an error on flush.
+		// If we add yet another takeover writer to finalize the object, that should
+		// succeed.
 		tw2, _, err := obj.Generation(w2.Attrs().Generation).NewWriterFromAppendableObject(ctx, &AppendableWriterOpts{
 			FinalizeOnClose: true,
 		})
@@ -4209,13 +4211,16 @@ func TestIntegration_WriterAppendEdgeCases(t *testing.T) {
 		if err := tw2.Close(); err != nil {
 			t.Fatalf("tw2.Close: %v", err)
 		}
-		h.mustDeleteObject(obj)
-		if _, err := tw.Write([]byte("abcde")); err != nil {
-			t.Fatalf("tw.Write: %v", err)
+
+		// `tw` should always fail to flush. Because `w2` overwrote the original
+		// object generation, `tw` might see either a fence error or a NOT_FOUND
+		// error.
+		_, err = tw.Write([]byte("abcde"))
+		if err == nil {
+			_, err = tw.Flush()
 		}
-		_, err = tw.Flush()
-		if code := status.Code(err); !(code == codes.FailedPrecondition || code == codes.Aborted) {
-			t.Errorf("tw.Flush: got error %v, want FailedPrecondition or Aborted", err)
+		if code := status.Code(err); !(code == codes.FailedPrecondition || code == codes.Aborted || code == codes.NotFound) {
+			t.Errorf("tw.Write or tw.Flush: got error %v, want FailedPrecondition, Aborted, or NotFound", err)
 		}
 	})
 }
