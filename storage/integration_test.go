@@ -2160,6 +2160,8 @@ func TestIntegration_MultiChunkWrite(t *testing.T) {
 
 func TestIntegration_WriterCRC32CValidation(t *testing.T) {
 	ctx := skipZonalBucket(context.Background(), "Test for resumable and oneshot writers")
+	ctx = skipExtraReadAPIs(ctx, "Test for uploads")
+
 	h := testHelper{t}
 	multiTransportTest(ctx, t, func(t *testing.T, ctx context.Context, bucket string, _ string, client *Client) {
 		testCases := []struct {
@@ -2170,6 +2172,7 @@ func TestIntegration_WriterCRC32CValidation(t *testing.T) {
 			disableAutoChecksum bool
 			incorrectChecksum   bool
 			wantErr             bool
+			sendMD5             bool
 		}{
 			{
 				name:       "oneshot with user-sent CRC32C",
@@ -2192,6 +2195,19 @@ func TestIntegration_WriterCRC32CValidation(t *testing.T) {
 				name:       "resumable with user-sent CRC32C",
 				content:    bytes.Repeat([]byte("a"), 1*MiB),
 				chunkSize:  256 * 1024,
+				sendCRC32C: true,
+			},
+			{
+				name:      "resumable with user-sent MD5",
+				content:   bytes.Repeat([]byte("a"), 1*MiB),
+				chunkSize: 256 * 1024,
+				sendMD5:   true,
+			},
+			{
+				name:       "resumable with user-sent MD5 & CRC32C",
+				content:    bytes.Repeat([]byte("a"), 1*MiB),
+				chunkSize:  256 * 1024,
+				sendMD5:    true,
 				sendCRC32C: true,
 			},
 			{
@@ -2236,6 +2252,10 @@ func TestIntegration_WriterCRC32CValidation(t *testing.T) {
 					w.CRC32C = correctCRC32C + 1
 				}
 				w.DisableAutoChecksum = tc.disableAutoChecksum
+				if tc.sendMD5 {
+					md5Sum := md5.Sum(tc.content)
+					w.MD5 = md5Sum[:]
+				}
 
 				if _, err := w.Write(tc.content); err != nil {
 					t.Fatalf("Writer.Write: %v", err)
