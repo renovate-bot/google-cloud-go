@@ -38,6 +38,11 @@ func TestGetObjectChecksums(t *testing.T) {
 			want:        nil,
 		},
 		{
+			name:        "objectAttrs is nil",
+			finishWrite: true,
+			want:        nil,
+		},
+		{
 			name:        "sendCRC32C is true, attrs have CRC32C",
 			finishWrite: true,
 			sendCRC32C:  true,
@@ -54,6 +59,23 @@ func TestGetObjectChecksums(t *testing.T) {
 			attrs:               &ObjectAttrs{CRC32C: 123},
 			want: &storagepb.ObjectChecksums{
 				Crc32C: proto.Uint32(123),
+			},
+		},
+		{
+			name:        "sendCRC32C is true",
+			finishWrite: true,
+			sendCRC32C:  true,
+			attrs:       &ObjectAttrs{CRC32C: 123},
+			want: &storagepb.ObjectChecksums{
+				Crc32C: proto.Uint32(123),
+			},
+		},
+		{
+			name:        "MD5 is provided",
+			finishWrite: true,
+			attrs:       &ObjectAttrs{MD5: []byte{1, 5, 0}},
+			want: &storagepb.ObjectChecksums{
+				Md5Hash: []byte{1, 5, 0},
 			},
 		},
 		{

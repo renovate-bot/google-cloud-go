@@ -851,11 +851,14 @@ func getObjectChecksums(params *getObjectChecksumsParams) *storagepb.ObjectCheck
 	}
 
 	// send user's checksum on last write op if available
-	if params.sendCRC32C || params.objectAttrs.MD5 != nil {
+	if params.sendCRC32C || (params.objectAttrs != nil && params.objectAttrs.MD5 != nil) {
 		return toProtoChecksums(params.sendCRC32C, params.objectAttrs)
 	}
 	// TODO(b/461982277): Enable checksum validation for appendable takeover writer gRPC
 	if params.disableAutoChecksum || params.takeoverWriter {
+		return nil
+	}
+	if params.fullObjectChecksum == nil {
 		return nil
 	}
 	return &storagepb.ObjectChecksums{
