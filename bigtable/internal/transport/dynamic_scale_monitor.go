@@ -27,19 +27,24 @@ import (
 // DynamicScaleMonitor manages upscale and downscale of the connection pool.
 // Owner: It is owned by BigtableClient
 type DynamicScaleMonitor struct {
-	config            btopt.DynamicChannelPoolConfig
-	pool              *BigtableChannelPool
-	lastScalingTime   time.Time
-	mu                sync.Mutex
-	ticker            *time.Ticker
-	done              chan struct{}
-	stopOnce          sync.Once
-	perConnTargetLoad float64 // target load per conn
+	config                  btopt.DynamicChannelPoolConfig
+	pool                    *BigtableChannelPool
+	lastScalingTime         time.Time
+	mu                      sync.Mutex
+	ticker                  *time.Ticker
+	done                    chan struct{}
+	stopOnce                sync.Once
+	perConnTargetLoad       float64 // target load per conn
+	continuousDownscaleRuns int     // avoid downscaling in one run
 
 }
 
 // NewDynamicScaleMonitor creates a new DynamicScaleMonitor.
 func NewDynamicScaleMonitor(config btopt.DynamicChannelPoolConfig, pool *BigtableChannelPool) *DynamicScaleMonitor {
+	// Fallback to a default threshold of 3 if specified 0.
+	if config.ContinuousDownscaleRunsThreshold == 0 {
+		config.ContinuousDownscaleRunsThreshold = 3
+	}
 
 	perConnTargetLoad := math.Floor(config.AvgLoadLowThreshold+config.AvgLoadHighThreshold) / 2.0
 	if perConnTargetLoad < 1.0 {
@@ -110,10 +115,28 @@ func (dsm *DynamicScaleMonitor) evaluateAndScale() {
 	}
 	currentAvgLoadPerConn := float64(currentLoadSum) / float64(currentConnsCount)
 
-	if currentAvgLoadPerConn >= dsm.config.AvgLoadHighThreshold {
-		dsm.scaleUp(currentLoadSum, currentConnsCount)
-	} else if currentAvgLoadPerConn <= dsm.config.AvgLoadLowThreshold {
-		dsm.scaleDown(currentLoadSum, currentConnsCount)
+	btopt.Debugf(dsm.pool.logger, "bigtable_connpool: evaluateAndScale currentLoadSum: %d, currentChannel: %d, avgLoad: %.2f\n", currentLoadSum, currentConnsCount, currentAvgLoadPerConn)
+
+	if currentAvgLoadPerConn <= dsm.config.AvgLoadLowThreshold {
+		dsm.continuousDownscaleRuns++
+
+		btopt.Debugf(dsm.pool.logger, "bigtable_connpool: Low load detected. Downscale streak: %d/%d\n", dsm.continuousDownscaleRuns, dsm.config.ContinuousDownscaleRunsThreshold)
+
+		if dsm.continuousDownscaleRuns >= dsm.config.ContinuousDownscaleRunsThreshold {
+			dsm.scaleDown(currentLoadSum, currentConnsCount)
+			dsm.continuousDownscaleRuns = 0
+		}
+	} else {
+		// Reset the downscale streak
+		if dsm.continuousDownscaleRuns > 0 {
+			btopt.Debugf(dsm.pool.logger, "bigtable_connpool: Load above low threshold. Resetting downscale streak from %d to 0.\n", dsm.continuousDownscaleRuns)
+			dsm.continuousDownscaleRuns = 0
+		}
+
+		// Proceed to check if we need to scale up
+		if currentAvgLoadPerConn >= dsm.config.AvgLoadHighThreshold {
+			dsm.scaleUp(currentLoadSum, currentConnsCount)
+		}
 	}
 }
 
@@ -139,6 +162,11 @@ func ValidateDynamicConfig(config btopt.DynamicChannelPoolConfig, connPoolSize i
 	}
 	if config.MaxRemoveConns <= 0 {
 		return fmt.Errorf("bigtable_connpool: DynamicChannelPoolConfig.MaxRemoveConns must be positive")
+	}
+
+	// Validate the new config field
+	if config.ContinuousDownscaleRunsThreshold < 0 {
+		return fmt.Errorf("bigtable_connpool: DynamicChannelPoolConfig.ContinuousDownscaleRunsThreshold cannot be negative")
 	}
 	return nil
 }
