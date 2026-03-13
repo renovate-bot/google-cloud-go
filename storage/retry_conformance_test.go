@@ -591,7 +591,7 @@ var methods = map[string][]retryFunc{
 			}
 
 			// Download the test object using the MultiRangeDownloader.
-			mrd, err := c.Bucket(fs.bucket.Name).Object(objName).NewMultiRangeDownloader(ctx)
+			mrd, err := c.Bucket(fs.bucket.Name).Object(objName).NewMultiRangeDownloader(ctx, WithMinConnections(2))
 			if err != nil {
 				return err
 			}
