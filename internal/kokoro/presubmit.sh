@@ -74,17 +74,18 @@ runPresubmitTests() {
     --junitfile sponge_log.xml \
     --format standard-verbose \
     -- "${go_test_args[@]}" 2>&1 | tee sponge_log.log
+  exit_code=$(($exit_code + ${PIPESTATUS[0]}))
 
   # Run integration tests against an emulator.
   if [ -f "emulator_test.sh" ]; then
     ./emulator_test.sh
+    exit_code=$(($exit_code + $?))
   fi
-  # Add the exit codes together so we exit non-zero if any module fails.
-  exit_code=$(($exit_code + $?))
+
   if [[ $PWD != *"/internal/"* ]]; then
     go build ./...
+    exit_code=$(($exit_code + $?))
   fi
-  exit_code=$(($exit_code + $?))
 }
 
 SIGNIFICANT_CHANGES=$(git --no-pager diff --name-only origin/$KOKORO_GITHUB_PULL_REQUEST_TARGET_BRANCH_google_cloud_go...$KOKORO_GIT_COMMIT_google_cloud_go |
