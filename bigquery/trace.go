@@ -83,3 +83,33 @@ func setModelTraceMetadata(ctx context.Context, projectID, datasetID, modelID st
 		modelResourceName(projectID, datasetID, modelID),
 		"/bigquery/v2/projects/{projectId}/datasets/{datasetId}/models/{modelId}")
 }
+
+// tableResourceName constructs the standard resource name for a table.
+// E.g., "//bigquery.googleapis.com/projects/{project}/datasets/{dataset}/tables/{table}"
+func tableResourceName(projectID, datasetID, tableID string) string {
+	return fmt.Sprintf("//bigquery.googleapis.com/projects/%s/datasets/%s/tables/%s", projectID, datasetID, tableID)
+}
+
+// routineResourceName constructs the standard resource name for a routine.
+// E.g., "//bigquery.googleapis.com/projects/{project}/datasets/{dataset}/routines/{routine}"
+func routineResourceName(projectID, datasetID, routineID string) string {
+	return fmt.Sprintf("//bigquery.googleapis.com/projects/%s/datasets/%s/routines/%s", projectID, datasetID, routineID)
+}
+
+func setTableTraceMetadata(ctx context.Context, projectID, datasetID, tableID string) context.Context {
+	if !gax.IsFeatureEnabled("TRACING") {
+		return ctx
+	}
+	return setTraceMetadata(ctx,
+		tableResourceName(projectID, datasetID, tableID),
+		"/bigquery/v2/projects/{projectId}/datasets/{datasetId}/tables/{tableId}")
+}
+
+func setRoutineTraceMetadata(ctx context.Context, projectID, datasetID, routineID string) context.Context {
+	if !gax.IsFeatureEnabled("TRACING") {
+		return ctx
+	}
+	return setTraceMetadata(ctx,
+		routineResourceName(projectID, datasetID, routineID),
+		"/bigquery/v2/projects/{projectId}/datasets/{datasetId}/routines/{routineId}")
+}

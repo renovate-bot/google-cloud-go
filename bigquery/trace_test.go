@@ -22,6 +22,8 @@ import (
 	"strings"
 	"testing"
 
+	"cloud.google.com/go/bigquery/internal"
+	"github.com/google/go-cmp/cmp"
 	"github.com/googleapis/gax-go/v2"
 	"github.com/googleapis/gax-go/v2/callctx"
 	"go.opentelemetry.io/otel"
@@ -58,7 +60,7 @@ func TestSetDatasetTraceMetadata(t *testing.T) {
 }
 
 func TestTracingTelemetryAttributes(t *testing.T) {
-	t.Skip("Skipping flaky test: https://github.com/googleapis/google-cloud-go/issues/14205")
+	t.Skip("Skipping flaky test pending auth module release: https://github.com/googleapis/google-cloud-go/issues/14205")
 	os.Setenv("GOOGLE_SDK_GO_EXPERIMENTAL_TRACING", "true")
 	defer os.Unsetenv("GOOGLE_SDK_GO_EXPERIMENTAL_TRACING")
 	gax.TestOnlyResetIsFeatureEnabled()
@@ -72,6 +74,7 @@ func TestTracingTelemetryAttributes(t *testing.T) {
 		wantResourceName string
 		wantURLTemplate  string
 		wantAttempts     int
+		wantMethod       string
 	}{
 		{
 			name: "Dataset_Metadata",
@@ -83,6 +86,7 @@ func TestTracingTelemetryAttributes(t *testing.T) {
 			wantResourceName: "//bigquery.googleapis.com/projects/test-project/datasets/test-dataset",
 			wantURLTemplate:  "/bigquery/v2/projects/{projectId}/datasets/{datasetId}",
 			wantAttempts:     1,
+			wantMethod:       "GET",
 		},
 		{
 			name: "Dataset_Create",
@@ -94,6 +98,7 @@ func TestTracingTelemetryAttributes(t *testing.T) {
 			wantResourceName: "//bigquery.googleapis.com/projects/test-project",
 			wantURLTemplate:  "/bigquery/v2/projects/{projectId}/datasets",
 			wantAttempts:     1,
+			wantMethod:       "POST",
 		},
 		{
 			name: "Dataset_Update",
@@ -105,6 +110,7 @@ func TestTracingTelemetryAttributes(t *testing.T) {
 			wantResourceName: "//bigquery.googleapis.com/projects/test-project/datasets/test-dataset",
 			wantURLTemplate:  "/bigquery/v2/projects/{projectId}/datasets/{datasetId}",
 			wantAttempts:     1,
+			wantMethod:       "PATCH",
 		},
 		{
 			name: "Dataset_Delete",
@@ -116,6 +122,7 @@ func TestTracingTelemetryAttributes(t *testing.T) {
 			wantResourceName: "//bigquery.googleapis.com/projects/test-project/datasets/test-dataset",
 			wantURLTemplate:  "/bigquery/v2/projects/{projectId}/datasets/{datasetId}",
 			wantAttempts:     1,
+			wantMethod:       "DELETE",
 		},
 		{
 			name: "Client_Datasets",
@@ -128,6 +135,7 @@ func TestTracingTelemetryAttributes(t *testing.T) {
 			wantResourceName: "//bigquery.googleapis.com/projects/test-project",
 			wantURLTemplate:  "/bigquery/v2/projects/{projectId}/datasets",
 			wantAttempts:     1,
+			wantMethod:       "GET",
 		},
 		{
 			name: "Dataset_Models",
@@ -140,6 +148,7 @@ func TestTracingTelemetryAttributes(t *testing.T) {
 			wantResourceName: "//bigquery.googleapis.com/projects/test-project/datasets/test-dataset",
 			wantURLTemplate:  "/bigquery/v2/projects/{projectId}/datasets/{datasetId}/models",
 			wantAttempts:     1,
+			wantMethod:       "GET",
 		},
 		{
 			name: "Model_Metadata",
@@ -151,6 +160,7 @@ func TestTracingTelemetryAttributes(t *testing.T) {
 			wantResourceName: "//bigquery.googleapis.com/projects/test-project/datasets/test-dataset/models/test-model",
 			wantURLTemplate:  "/bigquery/v2/projects/{projectId}/datasets/{datasetId}/models/{modelId}",
 			wantAttempts:     1,
+			wantMethod:       "GET",
 		},
 		{
 			name: "Model_Update",
@@ -162,6 +172,7 @@ func TestTracingTelemetryAttributes(t *testing.T) {
 			wantResourceName: "//bigquery.googleapis.com/projects/test-project/datasets/test-dataset/models/test-model",
 			wantURLTemplate:  "/bigquery/v2/projects/{projectId}/datasets/{datasetId}/models/{modelId}",
 			wantAttempts:     1,
+			wantMethod:       "PATCH",
 		},
 		{
 			name: "Model_Delete",
@@ -173,6 +184,129 @@ func TestTracingTelemetryAttributes(t *testing.T) {
 			wantResourceName: "//bigquery.googleapis.com/projects/test-project/datasets/test-dataset/models/test-model",
 			wantURLTemplate:  "/bigquery/v2/projects/{projectId}/datasets/{datasetId}/models/{modelId}",
 			wantAttempts:     1,
+			wantMethod:       "DELETE",
+		},
+		{
+			name: "Table_Create",
+			callFunc: func(ctx context.Context, client *Client) {
+				_ = client.Dataset("test-dataset").Table("test-table").Create(ctx, &TableMetadata{})
+			},
+			mockResponse:     `{"tableReference": {"projectId": "test-project", "datasetId": "test-dataset", "tableId": "test-table"}}`,
+			mockStatusCodes:  []int{http.StatusOK},
+			wantResourceName: "//bigquery.googleapis.com/projects/test-project/datasets/test-dataset",
+			wantURLTemplate:  "/bigquery/v2/projects/{projectId}/datasets/{datasetId}/tables",
+			wantAttempts:     1,
+			wantMethod:       "POST",
+		},
+		{
+			name: "Table_Metadata",
+			callFunc: func(ctx context.Context, client *Client) {
+				_, _ = client.Dataset("test-dataset").Table("test-table").Metadata(ctx)
+			},
+			mockResponse:     `{"tableReference": {"projectId": "test-project", "datasetId": "test-dataset", "tableId": "test-table"}}`,
+			mockStatusCodes:  []int{http.StatusOK},
+			wantResourceName: "//bigquery.googleapis.com/projects/test-project/datasets/test-dataset/tables/test-table",
+			wantURLTemplate:  "/bigquery/v2/projects/{projectId}/datasets/{datasetId}/tables/{tableId}",
+			wantAttempts:     1,
+			wantMethod:       "GET",
+		},
+		{
+			name: "Table_Update",
+			callFunc: func(ctx context.Context, client *Client) {
+				_, _ = client.Dataset("test-dataset").Table("test-table").Update(ctx, TableMetadataToUpdate{}, "")
+			},
+			mockResponse:     `{"tableReference": {"projectId": "test-project", "datasetId": "test-dataset", "tableId": "test-table"}}`,
+			mockStatusCodes:  []int{http.StatusOK},
+			wantResourceName: "//bigquery.googleapis.com/projects/test-project/datasets/test-dataset/tables/test-table",
+			wantURLTemplate:  "/bigquery/v2/projects/{projectId}/datasets/{datasetId}/tables/{tableId}",
+			wantAttempts:     1,
+			wantMethod:       "PATCH",
+		},
+		{
+			name: "Table_Delete",
+			callFunc: func(ctx context.Context, client *Client) {
+				_ = client.Dataset("test-dataset").Table("test-table").Delete(ctx)
+			},
+			mockResponse:     `{}`,
+			mockStatusCodes:  []int{http.StatusOK},
+			wantResourceName: "//bigquery.googleapis.com/projects/test-project/datasets/test-dataset/tables/test-table",
+			wantURLTemplate:  "/bigquery/v2/projects/{projectId}/datasets/{datasetId}/tables/{tableId}",
+			wantAttempts:     1,
+			wantMethod:       "DELETE",
+		},
+		{
+			name: "Dataset_Tables",
+			callFunc: func(ctx context.Context, client *Client) {
+				it := client.Dataset("test-dataset").Tables(ctx)
+				_, _ = it.Next()
+			},
+			mockResponse:     `{"tables": [{"tableReference": {"projectId": "test-project", "datasetId": "test-dataset", "tableId": "test-table"}}]}`,
+			mockStatusCodes:  []int{http.StatusOK},
+			wantResourceName: "//bigquery.googleapis.com/projects/test-project/datasets/test-dataset",
+			wantURLTemplate:  "/bigquery/v2/projects/{projectId}/datasets/{datasetId}/tables",
+			wantAttempts:     1,
+			wantMethod:       "GET",
+		},
+		{
+			name: "Routine_Create",
+			callFunc: func(ctx context.Context, client *Client) {
+				_ = client.Dataset("test-dataset").Routine("test-routine").Create(ctx, &RoutineMetadata{})
+			},
+			mockResponse:     `{"routineReference": {"projectId": "test-project", "datasetId": "test-dataset", "routineId": "test-routine"}}`,
+			mockStatusCodes:  []int{http.StatusOK},
+			wantResourceName: "//bigquery.googleapis.com/projects/test-project/datasets/test-dataset",
+			wantURLTemplate:  "/bigquery/v2/projects/{projectId}/datasets/{datasetId}/routines",
+			wantAttempts:     1,
+			wantMethod:       "POST",
+		},
+		{
+			name: "Routine_Metadata",
+			callFunc: func(ctx context.Context, client *Client) {
+				_, _ = client.Dataset("test-dataset").Routine("test-routine").Metadata(ctx)
+			},
+			mockResponse:     `{"routineReference": {"projectId": "test-project", "datasetId": "test-dataset", "routineId": "test-routine"}}`,
+			mockStatusCodes:  []int{http.StatusOK},
+			wantResourceName: "//bigquery.googleapis.com/projects/test-project/datasets/test-dataset/routines/test-routine",
+			wantURLTemplate:  "/bigquery/v2/projects/{projectId}/datasets/{datasetId}/routines/{routineId}",
+			wantAttempts:     1,
+			wantMethod:       "GET",
+		},
+		{
+			name: "Routine_Update",
+			callFunc: func(ctx context.Context, client *Client) {
+				_, _ = client.Dataset("test-dataset").Routine("test-routine").Update(ctx, &RoutineMetadataToUpdate{}, "")
+			},
+			mockResponse:     `{"routineReference": {"projectId": "test-project", "datasetId": "test-dataset", "routineId": "test-routine"}}`,
+			mockStatusCodes:  []int{http.StatusOK},
+			wantResourceName: "//bigquery.googleapis.com/projects/test-project/datasets/test-dataset/routines/test-routine",
+			wantURLTemplate:  "/bigquery/v2/projects/{projectId}/datasets/{datasetId}/routines/{routineId}",
+			wantAttempts:     1,
+			wantMethod:       "PUT",
+		},
+		{
+			name: "Routine_Delete",
+			callFunc: func(ctx context.Context, client *Client) {
+				_ = client.Dataset("test-dataset").Routine("test-routine").Delete(ctx)
+			},
+			mockResponse:     `{}`,
+			mockStatusCodes:  []int{http.StatusOK},
+			wantResourceName: "//bigquery.googleapis.com/projects/test-project/datasets/test-dataset/routines/test-routine",
+			wantURLTemplate:  "/bigquery/v2/projects/{projectId}/datasets/{datasetId}/routines/{routineId}",
+			wantAttempts:     1,
+			wantMethod:       "DELETE",
+		},
+		{
+			name: "Dataset_Routines",
+			callFunc: func(ctx context.Context, client *Client) {
+				it := client.Dataset("test-dataset").Routines(ctx)
+				_, _ = it.Next()
+			},
+			mockResponse:     `{"routines": [{"routineReference": {"projectId": "test-project", "datasetId": "test-dataset", "routineId": "test-routine"}}]}`,
+			mockStatusCodes:  []int{http.StatusOK},
+			wantResourceName: "//bigquery.googleapis.com/projects/test-project/datasets/test-dataset",
+			wantURLTemplate:  "/bigquery/v2/projects/{projectId}/datasets/{datasetId}/routines",
+			wantAttempts:     1,
+			wantMethod:       "GET",
 		},
 		{
 			name: "Retry_Dataset_Metadata",
@@ -184,6 +318,7 @@ func TestTracingTelemetryAttributes(t *testing.T) {
 			wantResourceName: "//bigquery.googleapis.com/projects/test-project/datasets/test-dataset",
 			wantURLTemplate:  "/bigquery/v2/projects/{projectId}/datasets/{datasetId}",
 			wantAttempts:     2,
+			wantMethod:       "GET",
 		},
 	}
 
@@ -233,44 +368,56 @@ func TestTracingTelemetryAttributes(t *testing.T) {
 				if strings.Contains(span.Name, tt.wantURLTemplate) {
 					networkSpans++
 
-					foundRes := false
-					foundURL := false
-					foundArtifact := false
-					foundLanguage := false
-					foundDomain := false
+					expectedAttributes := map[attribute.Key]string{
+						"gcp.resource.destination.id": tt.wantResourceName,
+						"url.template":                tt.wantURLTemplate,
+						"gcp.client.artifact":         "cloud.google.com/go/bigquery",
+						"gcp.client.language":         "go",
+						"gcp.client.repo":             "googleapis/google-cloud-go",
+						"gcp.client.service":          "bigquery.googleapis.com",
+						"gcp.client.version":          internal.Version,
+						"http.request.method":         tt.wantMethod,
+						"http.response.status_code":   "",
+						"network.protocol.version":    "1.1",
+						"rpc.system.name":             "http",
+						"url.domain":                  "bigquery.googleapis.com",
+					}
 
+					actualAttributes := make(map[attribute.Key]string, len(span.Attributes))
 					for _, attr := range span.Attributes {
-						if attr.Key == attribute.Key("gcp.resource.destination.id") && attr.Value.AsString() == tt.wantResourceName {
-							foundRes = true
-						}
-						if attr.Key == attribute.Key("url.template") && attr.Value.AsString() == tt.wantURLTemplate {
-							foundURL = true
-						}
-						if attr.Key == attribute.Key("gcp.client.artifact") && attr.Value.AsString() == "cloud.google.com/go/bigquery" {
-							foundArtifact = true
-						}
-						if attr.Key == attribute.Key("gcp.client.language") && attr.Value.AsString() == "go" {
-							foundLanguage = true
-						}
-						if attr.Key == attribute.Key("url.domain") && attr.Value.AsString() == "bigquery.googleapis.com" {
-							foundDomain = true
-						}
+						actualAttributes[attr.Key] = attr.Value.AsString()
 					}
 
-					if !foundRes {
-						t.Errorf("missing gcp.resource.destination.id attribute on network span attempt")
+					if tt.name == "Retry_Dataset_Metadata" && actualAttributes["error.type"] == "503" {
+						expectedAttributes["error.type"] = "503"
+						expectedAttributes["status.message"] = "503 Service Unavailable"
 					}
-					if !foundURL {
-						t.Errorf("missing url.template attribute on network span attempt")
+
+					// Verify dynamic fields and then delete them so cmp.Diff doesn't fail
+					if val, ok := actualAttributes["url.full"]; ok {
+						if !strings.HasPrefix(val, ts.URL) {
+							t.Errorf("url.full mismatch: got %v, want prefix %v", val, ts.URL)
+						}
+						delete(actualAttributes, "url.full")
+					} else {
+						t.Errorf("missing url.full attribute")
 					}
-					if !foundArtifact {
-						t.Errorf("missing gcp.client.artifact attribute on network span attempt")
+
+					if val, ok := actualAttributes["server.address"]; ok {
+						if !strings.Contains(ts.URL, val) {
+							t.Errorf("server.address mismatch: got %v, want it in %v", val, ts.URL)
+						}
+						delete(actualAttributes, "server.address")
+					} else {
+						t.Errorf("missing server.address attribute")
 					}
-					if !foundLanguage {
-						t.Errorf("missing gcp.client.language attribute on network span attempt")
+
+					if _, ok := actualAttributes["server.port"]; ok {
+						delete(actualAttributes, "server.port")
 					}
-					if !foundDomain {
-						t.Errorf("missing url.domain attribute on network span attempt")
+
+					if diff := cmp.Diff(expectedAttributes, actualAttributes); diff != "" {
+						t.Errorf("attributes mismatch (-want +got):\n%s", diff)
 					}
 				}
 			}
