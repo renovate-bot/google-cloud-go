@@ -15,15 +15,21 @@
 package grpctransport
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
+	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/googleapis/gax-go/v2"
+	"github.com/googleapis/gax-go/v2/apierror"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -32,8 +38,10 @@ import (
 
 	"github.com/googleapis/gax-go/v2/callctx"
 	oteltrace "go.opentelemetry.io/otel/trace"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
 
 	echo "cloud.google.com/go/auth/grpctransport/testdata"
@@ -611,3 +619,378 @@ func TestDial_OpenTelemetry_Disabled(t *testing.T) {
 		})
 	}
 }
+
+func TestHandleRPC_ActionableErrors(t *testing.T) {
+	// Do not add t.Parallel() to these tests. The global resetting will cause
+	// flaky tests because they will stomp over each other's feature flag state.
+	gax.TestOnlyResetIsFeatureEnabled()
+	defer gax.TestOnlyResetIsFeatureEnabled()
+	t.Setenv("GOOGLE_SDK_GO_EXPERIMENTAL_LOGGING", "true")
+
+	stWithReason := status.New(grpccodes.Unavailable, "network timeout")
+	ei := &errdetails.ErrorInfo{
+		Reason: "RATE_LIMIT_EXCEEDED",
+		Domain: "googleapis.com",
+		Metadata: map[string]string{
+			"quota_limit": "100",
+		},
+	}
+	stWithReason, _ = stWithReason.WithDetails(ei)
+
+	stDifferentReason := status.New(grpccodes.PermissionDenied, "not allowed")
+	eiDiff := &errdetails.ErrorInfo{
+		Reason: "IAM_PERMISSION_DENIED",
+		Domain: "iam.googleapis.com",
+	}
+	stDifferentReason, _ = stDifferentReason.WithDetails(eiDiff)
+
+	stMatchingMsgReason := status.New(grpccodes.PermissionDenied, "IAM_PERMISSION_DENIED: User does not have permission")
+	eiMatching := &errdetails.ErrorInfo{
+		Reason: "IAM_PERMISSION_DENIED",
+		Domain: "iam.googleapis.com",
+	}
+	stMatchingMsgReason, _ = stMatchingMsgReason.WithDetails(eiMatching)
+
+	stEmptyMsg := status.New(grpccodes.Internal, "")
+
+	tests := []struct {
+		name     string
+		err      error
+		setupCtx func(context.Context) (context.Context, context.CancelFunc)
+		want     map[string]any
+	}{
+		{
+			name: "ErrorInfo Actionable Error",
+			err:  stWithReason.Err(),
+			want: map[string]any{
+				"level":                           "DEBUG",
+				"msg":                             "network timeout",
+				"rpc.system.name":                 "grpc",
+				"rpc.response.status_code":        "UNAVAILABLE",
+				"error.type":                      "RATE_LIMIT_EXCEEDED",
+				"gcp.errors.domain":               "googleapis.com",
+				"gcp.errors.metadata.quota_limit": "100",
+				"gcp.client.version":              "1.2.3",
+			},
+		},
+		{
+			name: "Different ErrorInfo Reason and GRPC Status",
+			err:  stDifferentReason.Err(),
+			want: map[string]any{
+				"level":                    "DEBUG",
+				"msg":                      "not allowed",
+				"rpc.system.name":          "grpc",
+				"rpc.response.status_code": "PERMISSION_DENIED",
+				"error.type":               "IAM_PERMISSION_DENIED",
+				"gcp.errors.domain":        "iam.googleapis.com",
+				"gcp.client.version":       "1.2.3",
+			},
+		},
+		{
+			name: "Matching Message and Reason",
+			err:  stMatchingMsgReason.Err(),
+			want: map[string]any{
+				"level":                    "DEBUG",
+				"msg":                      "IAM_PERMISSION_DENIED: User does not have permission",
+				"rpc.system.name":          "grpc",
+				"rpc.response.status_code": "PERMISSION_DENIED",
+				"error.type":               "IAM_PERMISSION_DENIED",
+				"gcp.errors.domain":        "iam.googleapis.com",
+				"gcp.client.version":       "1.2.3",
+			},
+		},
+		{
+			name: "APIError Wrapped",
+			err:  func() error { err, _ := apierror.FromError(stWithReason.Err()); return err }(),
+			setupCtx: func(ctx context.Context) (context.Context, context.CancelFunc) {
+				ctx = callctx.WithTelemetryContext(ctx, "resend_count", "3")
+				ctx = callctx.WithTelemetryContext(ctx, "resource_name", "my-resource")
+				return ctx, nil
+			},
+			want: map[string]any{
+				"level":                           "DEBUG",
+				"msg":                             "network timeout",
+				"rpc.system.name":                 "grpc",
+				"rpc.response.status_code":        "UNAVAILABLE",
+				"error.type":                      "RATE_LIMIT_EXCEEDED",
+				"gcp.errors.domain":               "googleapis.com",
+				"gcp.errors.metadata.quota_limit": "100",
+				"gcp.grpc.resend_count":           float64(3),
+				"gcp.resource.destination.id":     "my-resource",
+				"gcp.client.version":              "1.2.3",
+			},
+		},
+		{
+			name: "CLIENT_TIMEOUT",
+			err:  context.DeadlineExceeded,
+			setupCtx: func(ctx context.Context) (context.Context, context.CancelFunc) {
+				return context.WithDeadline(ctx, time.Now().Add(-1*time.Second))
+			},
+			want: map[string]any{
+				"level":                    "DEBUG",
+				"msg":                      "context deadline exceeded",
+				"rpc.system.name":          "grpc",
+				"rpc.response.status_code": "DEADLINE_EXCEEDED",
+				"error.type":               "CLIENT_TIMEOUT",
+				"gcp.client.version":       "1.2.3",
+			},
+		},
+		{
+			name: "CLIENT_CANCELLED",
+			err:  context.Canceled,
+			setupCtx: func(ctx context.Context) (context.Context, context.CancelFunc) {
+				return context.WithCancel(ctx)
+			},
+			want: map[string]any{
+				"level":                    "DEBUG",
+				"msg":                      "context canceled",
+				"rpc.system.name":          "grpc",
+				"rpc.response.status_code": "CANCELED",
+				"error.type":               "CLIENT_CANCELLED",
+				"gcp.client.version":       "1.2.3",
+			},
+		},
+		{
+			name: "Fallback error type",
+			err:  errors.New("custom error"),
+			want: map[string]any{
+				"level":                    "DEBUG",
+				"msg":                      "custom error",
+				"rpc.system.name":          "grpc",
+				"rpc.response.status_code": "UNKNOWN",
+				"error.type":               "*errors.errorString",
+				"gcp.client.version":       "1.2.3",
+			},
+		},
+		{
+			name: "Empty Message Status",
+			err:  stEmptyMsg.Err(),
+			want: map[string]any{
+				"level":                    "DEBUG",
+				"msg":                      "API call failed",
+				"rpc.system.name":          "grpc",
+				"rpc.response.status_code": "INTERNAL",
+				"error.type":               "*status.Error",
+				"gcp.client.version":       "1.2.3",
+			},
+		},
+		{
+			name: "Fast Exit No Logging No Tracing",
+			err:  errors.New("should not log"),
+			setupCtx: func(ctx context.Context) (context.Context, context.CancelFunc) {
+				t.Setenv("GOOGLE_SDK_GO_EXPERIMENTAL_LOGGING", "false")
+				gax.TestOnlyResetIsFeatureEnabled()
+				return ctx, nil
+			},
+			want: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("GOOGLE_SDK_GO_EXPERIMENTAL_LOGGING", "true")
+			gax.TestOnlyResetIsFeatureEnabled()
+
+			var logBuf bytes.Buffer
+			logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+			ctx := callctx.WithLoggerContext(context.Background(), logger)
+
+			if tt.setupCtx != nil {
+				var cancel context.CancelFunc
+				ctx, cancel = tt.setupCtx(ctx)
+				if cancel != nil {
+					cancel()
+					defer cancel()
+				}
+			}
+
+			staticLogAttrs := []any{
+				slog.String("gcp.client.version", "1.2.3"),
+			}
+
+			h := &otelHandler{
+				Handler: &mockStatsHandler{},
+				logger:  logger.With(staticLogAttrs...),
+			}
+
+			h.HandleRPC(ctx, &stats.End{Error: tt.err})
+
+			logOutput := logBuf.String()
+
+			if tt.want == nil {
+				if strings.TrimSpace(logOutput) != "" {
+					t.Fatalf("Expected no log output, got: %s", logOutput)
+				}
+				return
+			}
+
+			if strings.Count(strings.TrimSpace(logOutput), "\n") > 0 {
+				t.Fatalf("Expected exactly 1 log record, got multiple: %s", logOutput)
+			}
+
+			var got map[string]any
+			if err := json.Unmarshal(logBuf.Bytes(), &got); err != nil {
+				t.Fatalf("failed to unmarshal log JSON: %v", err)
+			}
+
+			if _, ok := got["time"].(string); !ok {
+				t.Errorf("Expected time attribute of type string, got: %v", got["time"])
+			}
+			delete(got, "time")
+
+			if diff := cmp.Diff(tt.want, got); diff != "" {
+				t.Errorf("Log attributes mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestDial_TracingAndLogging_Combinations(t *testing.T) {
+	// Ensure any lingering HTTP/2 connections are closed to avoid goroutine leaks.
+	defer http.DefaultTransport.(*http.Transport).CloseIdleConnections()
+
+	exporter := tracetest.NewInMemoryExporter()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+	defer tp.Shutdown(context.Background())
+
+	// Restore the global tracer provider after the test to avoid side effects.
+	defer func(prev oteltrace.TracerProvider) { otel.SetTracerProvider(prev) }(otel.GetTracerProvider())
+	otel.SetTracerProvider(tp)
+
+	errorEchoer := &fakeEchoService{
+		Fn: func(ctx context.Context, req *echo.EchoRequest) (*echo.EchoReply, error) {
+			return nil, status.Error(grpccodes.Internal, "test error")
+		},
+	}
+
+	tests := []struct {
+		name             string
+		logging          bool
+		tracing          bool
+		wantLog          bool
+		wantTracingAttrs bool
+	}{
+		{
+			name:             "both disabled",
+			logging:          false,
+			tracing:          false,
+			wantLog:          false,
+			wantTracingAttrs: false,
+		},
+		{
+			name:             "tracing enabled, logging disabled",
+			logging:          false,
+			tracing:          true,
+			wantLog:          false,
+			wantTracingAttrs: true,
+		},
+		{
+			name:             "tracing disabled, logging enabled",
+			logging:          true,
+			tracing:          false,
+			wantLog:          true,
+			wantTracingAttrs: true,
+		},
+		{
+			name:             "both enabled",
+			logging:          true,
+			tracing:          true,
+			wantLog:          true,
+			wantTracingAttrs: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			exporter.Reset()
+			gax.TestOnlyResetIsFeatureEnabled()
+			defer gax.TestOnlyResetIsFeatureEnabled()
+
+			if tt.logging {
+				t.Setenv("GOOGLE_SDK_GO_EXPERIMENTAL_LOGGING", "true")
+			} else {
+				t.Setenv("GOOGLE_SDK_GO_EXPERIMENTAL_LOGGING", "false")
+			}
+			if tt.tracing {
+				t.Setenv("GOOGLE_SDK_GO_EXPERIMENTAL_TRACING", "true")
+			} else {
+				t.Setenv("GOOGLE_SDK_GO_EXPERIMENTAL_TRACING", "false")
+			}
+
+			l, err := net.Listen("tcp", "localhost:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			gsrv := grpc.NewServer()
+			echo.RegisterEchoerServer(gsrv, errorEchoer)
+			go func() {
+				if err := gsrv.Serve(l); err != nil {
+					panic(err)
+				}
+			}()
+			defer gsrv.Stop()
+
+			var logBuf bytes.Buffer
+			logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+			opts := &Options{
+				Endpoint:              l.Addr().String(),
+				DisableAuthentication: true,
+				Logger:                logger,
+				InternalOptions: &InternalOptions{
+					TelemetryAttributes: map[string]string{
+						"gcp.client.version": "1.2.3",
+					},
+				},
+				GRPCDialOpts: []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
+			}
+
+			pool, err := Dial(context.Background(), false, opts)
+			if err != nil {
+				t.Fatalf("Dial() = %v, want nil", err)
+			}
+			defer pool.Close()
+
+			client := echo.NewEchoerClient(pool)
+			_, _ = client.Echo(context.Background(), &echo.EchoRequest{Message: "hello"})
+
+			logOutput := logBuf.String()
+			hasLog := strings.TrimSpace(logOutput) != ""
+
+			if hasLog != tt.wantLog {
+				t.Errorf("got log: %v, want: %v\noutput: %s", hasLog, tt.wantLog, logOutput)
+			}
+
+			spans := exporter.GetSpans()
+			if len(spans) != 1 {
+				t.Fatalf("len(spans) = %d, want 1", len(spans))
+			}
+
+			hasTracingAttrs := false
+			for _, attr := range spans[0].Attributes {
+				if attr.Key == "gcp.client.version" && attr.Value.AsString() == "1.2.3" {
+					hasTracingAttrs = true
+					break
+				}
+			}
+
+			if hasTracingAttrs != tt.wantTracingAttrs {
+				t.Errorf("got tracing attrs: %v, want: %v", hasTracingAttrs, tt.wantTracingAttrs)
+			}
+		})
+	}
+}
+
+type mockStatsHandler struct{}
+
+func (m *mockStatsHandler) TagRPC(ctx context.Context, info *stats.RPCTagInfo) context.Context {
+	return ctx
+}
+
+func (m *mockStatsHandler) HandleRPC(ctx context.Context, rs stats.RPCStats) {}
+
+func (m *mockStatsHandler) TagConn(ctx context.Context, info *stats.ConnTagInfo) context.Context {
+	return ctx
+}
+
+func (m *mockStatsHandler) HandleConn(ctx context.Context, cs stats.ConnStats) {}
