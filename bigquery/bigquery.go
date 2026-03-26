@@ -161,6 +161,7 @@ func (c *Client) Close() error {
 
 // Calls the Jobs.Insert RPC and returns a Job.
 func (c *Client) insertJob(ctx context.Context, job *bq.Job, media io.Reader, mediaOpts ...googleapi.MediaOption) (*Job, error) {
+	ctx = setProjectItemTraceMetadata(ctx, c.projectID, "jobs")
 	call := c.bqs.Jobs.Insert(c.projectID, job).Context(ctx)
 	setClientHeader(call.Header())
 	if media != nil {
@@ -195,6 +196,7 @@ func (c *Client) insertJob(ctx context.Context, job *bq.Job, media io.Reader, me
 // Due to differences in options it supports, it cannot be used for all existing
 // jobs.insert requests that are query jobs.
 func (c *Client) runQuery(ctx context.Context, queryRequest *bq.QueryRequest) (*bq.QueryResponse, error) {
+	ctx = setProjectItemTraceMetadata(ctx, c.projectID, "queries")
 	call := c.bqs.Jobs.Query(c.projectID, queryRequest).Context(ctx)
 	setClientHeader(call.Header())
 

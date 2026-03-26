@@ -113,3 +113,36 @@ func setRoutineTraceMetadata(ctx context.Context, projectID, datasetID, routineI
 		routineResourceName(projectID, datasetID, routineID),
 		"/bigquery/v2/projects/{projectId}/datasets/{datasetId}/routines/{routineId}")
 }
+
+// jobResourceName constructs the standard resource name for a job.
+// E.g., "//bigquery.googleapis.com/projects/{project}/jobs/{jobId}"
+func jobResourceName(projectID, jobID string) string {
+	return fmt.Sprintf("//bigquery.googleapis.com/projects/%s/jobs/%s", projectID, jobID)
+}
+
+func setJobTraceMetadata(ctx context.Context, projectID, jobID string) context.Context {
+	if !gax.IsFeatureEnabled("TRACING") {
+		return ctx
+	}
+	return setTraceMetadata(ctx,
+		jobResourceName(projectID, jobID),
+		"/bigquery/v2/projects/{projectId}/jobs/{jobId}")
+}
+
+func setTableItemTraceMetadata(ctx context.Context, projectID, datasetID, tableID, childType string) context.Context {
+	if !gax.IsFeatureEnabled("TRACING") {
+		return ctx
+	}
+	return setTraceMetadata(ctx,
+		tableResourceName(projectID, datasetID, tableID),
+		fmt.Sprintf("/bigquery/v2/projects/{projectId}/datasets/{datasetId}/tables/{tableId}/%s", childType))
+}
+
+func setJobItemTraceMetadata(ctx context.Context, projectID, jobID, childType string) context.Context {
+	if !gax.IsFeatureEnabled("TRACING") {
+		return ctx
+	}
+	return setTraceMetadata(ctx,
+		jobResourceName(projectID, jobID),
+		fmt.Sprintf("/bigquery/v2/projects/{projectId}/jobs/{jobId}/%s", childType))
+}

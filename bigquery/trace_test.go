@@ -30,6 +30,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	bq "google.golang.org/api/bigquery/v2"
 	"google.golang.org/api/option"
 )
 
@@ -309,6 +310,85 @@ func TestTracingTelemetryAttributes(t *testing.T) {
 			wantMethod:       "GET",
 		},
 		{
+			name: "Job_Cancel",
+			callFunc: func(ctx context.Context, client *Client) {
+				job := &Job{projectID: "test-project", jobID: "test-job", c: client}
+				_ = job.Cancel(ctx)
+			},
+			mockResponse:     `{"jobReference": {"projectId": "test-project", "jobId": "test-job"}}`,
+			mockStatusCodes:  []int{http.StatusOK},
+			wantResourceName: "//bigquery.googleapis.com/projects/test-project/jobs/test-job",
+			wantURLTemplate:  "/bigquery/v2/projects/{projectId}/jobs/{jobId}/cancel",
+			wantAttempts:     1,
+			wantMethod:       "POST",
+		},
+		{
+			name: "Job_Delete",
+			callFunc: func(ctx context.Context, client *Client) {
+				job := &Job{projectID: "test-project", jobID: "test-job", c: client}
+				_ = job.Delete(ctx)
+			},
+			mockResponse:     `{}`,
+			mockStatusCodes:  []int{http.StatusOK},
+			wantResourceName: "//bigquery.googleapis.com/projects/test-project/jobs/test-job",
+			wantURLTemplate:  "/bigquery/v2/projects/{projectId}/jobs/{jobId}",
+			wantAttempts:     1,
+			wantMethod:       "DELETE",
+		},
+		{
+			name: "Client_Query",
+			callFunc: func(ctx context.Context, client *Client) {
+				q := client.Query("SELECT 1")
+				_, _ = q.Read(ctx)
+			},
+			mockResponse:     `{"jobReference": {"projectId": "test-project", "jobId": "test-job"}, "jobComplete": true}`,
+			mockStatusCodes:  []int{http.StatusOK},
+			wantResourceName: "//bigquery.googleapis.com/projects/test-project",
+			wantURLTemplate:  "/bigquery/v2/projects/{projectId}/queries",
+			wantAttempts:     1,
+			wantMethod:       "POST",
+		},
+		{
+			name: "Client_Jobs",
+			callFunc: func(ctx context.Context, client *Client) {
+				it := client.Jobs(ctx)
+				_, _ = it.Next()
+			},
+			mockResponse:     `{"jobs": [{"jobReference": {"projectId": "test-project", "jobId": "test-job"}}]}`,
+			mockStatusCodes:  []int{http.StatusOK},
+			wantResourceName: "//bigquery.googleapis.com/projects/test-project",
+			wantURLTemplate:  "/bigquery/v2/projects/{projectId}/jobs",
+			wantAttempts:     1,
+			wantMethod:       "GET",
+		},
+		{
+			name: "Job_GetQueryResults",
+			callFunc: func(ctx context.Context, client *Client) {
+				job := &Job{projectID: "test-project", jobID: "test-job", c: client, config: &bq.JobConfiguration{Query: &bq.JobConfigurationQuery{}}}
+				_, _ = job.Read(ctx)
+			},
+			mockResponse:     `{"jobReference": {"projectId": "test-project", "jobId": "test-job"}, "jobComplete": true}`,
+			mockStatusCodes:  []int{http.StatusOK},
+			wantResourceName: "//bigquery.googleapis.com/projects/test-project/jobs/test-job",
+			wantURLTemplate:  "/bigquery/v2/projects/{projectId}/jobs/{jobId}/getQueryResults",
+			wantAttempts:     1,
+			wantMethod:       "GET",
+		},
+		{
+			name: "Inserter_Put",
+			callFunc: func(ctx context.Context, client *Client) {
+				ins := client.Dataset("test-dataset").Table("test-table").Inserter()
+				_ = ins.Put(ctx, []ValueSaver{
+					&ValuesSaver{Schema: Schema{{Name: "name", Type: StringFieldType}}, Row: []Value{"test"}},
+				})
+			},
+			mockResponse:     `{"insertErrors": []}`,
+			mockStatusCodes:  []int{http.StatusOK},
+			wantResourceName: "//bigquery.googleapis.com/projects/test-project/datasets/test-dataset/tables/test-table",
+			wantURLTemplate:  "/bigquery/v2/projects/{projectId}/datasets/{datasetId}/tables/{tableId}/insertAll",
+			wantAttempts:     1,
+			wantMethod:       "POST",
+		}, {
 			name: "Retry_Dataset_Metadata",
 			callFunc: func(ctx context.Context, client *Client) {
 				_, _ = client.Dataset("test-dataset").Metadata(ctx)
