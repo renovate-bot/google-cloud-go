@@ -191,11 +191,7 @@ func (c *keyRecipeCache) computeReadKeys(req *sppb.ReadRequest) {
 	if target == nil {
 		return
 	}
-	hint.Key = append(hint.Key[:0], target.start...)
-	hint.LimitKey = hint.LimitKey[:0]
-	if len(target.limit) > 0 {
-		hint.LimitKey = append(hint.LimitKey, target.limit...)
-	}
+	c.applyTargetRange(hint, target)
 }
 
 func (c *keyRecipeCache) computeQueryKeys(req *sppb.ExecuteSqlRequest) {
@@ -229,11 +225,7 @@ func (c *keyRecipeCache) computeQueryKeys(req *sppb.ExecuteSqlRequest) {
 	if target == nil {
 		return
 	}
-	hint.Key = append(hint.Key[:0], target.start...)
-	hint.LimitKey = hint.LimitKey[:0]
-	if len(target.limit) > 0 {
-		hint.LimitKey = append(hint.LimitKey, target.limit...)
-	}
+	c.applyTargetRange(hint, target)
 }
 
 func (c *keyRecipeCache) mutationToTargetRange(mutation *sppb.Mutation) *targetRange {
@@ -251,6 +243,28 @@ func (c *keyRecipeCache) mutationToTargetRange(mutation *sppb.Mutation) *targetR
 		return nil
 	}
 	return recipe.mutationToTargetRange(mutation)
+}
+
+func (c *keyRecipeCache) applySchemaGeneration(hint *sppb.RoutingHint) {
+	if hint == nil {
+		return
+	}
+	c.mu.Lock()
+	if len(c.schemaGeneration) > 0 {
+		hint.SchemaGeneration = append([]byte(nil), c.schemaGeneration...)
+	}
+	c.mu.Unlock()
+}
+
+func (c *keyRecipeCache) applyTargetRange(hint *sppb.RoutingHint, target *targetRange) {
+	if hint == nil || target == nil {
+		return
+	}
+	hint.Key = append(hint.Key[:0], target.start...)
+	hint.LimitKey = hint.LimitKey[:0]
+	if len(target.limit) > 0 {
+		hint.LimitKey = append(hint.LimitKey, target.limit...)
+	}
 }
 
 func (c *keyRecipeCache) clear() {
@@ -350,6 +364,20 @@ func ensureReadRoutingHint(req *sppb.ReadRequest) *sppb.RoutingHint {
 }
 
 func ensureExecuteSQLRoutingHint(req *sppb.ExecuteSqlRequest) *sppb.RoutingHint {
+	if req.RoutingHint == nil {
+		req.RoutingHint = &sppb.RoutingHint{}
+	}
+	return req.RoutingHint
+}
+
+func ensureBeginTransactionRoutingHint(req *sppb.BeginTransactionRequest) *sppb.RoutingHint {
+	if req.RoutingHint == nil {
+		req.RoutingHint = &sppb.RoutingHint{}
+	}
+	return req.RoutingHint
+}
+
+func ensureCommitRoutingHint(req *sppb.CommitRequest) *sppb.RoutingHint {
 	if req.RoutingHint == nil {
 		req.RoutingHint = &sppb.RoutingHint{}
 	}

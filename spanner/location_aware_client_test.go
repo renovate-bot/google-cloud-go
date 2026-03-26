@@ -26,6 +26,7 @@ import (
 	"github.com/googleapis/gax-go/v2"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/proto"
 	structpb "google.golang.org/protobuf/types/known/structpb"
 )
 
@@ -47,6 +48,8 @@ type mockSpannerClient struct {
 	commitCount            int
 	rollbackCount          int
 	closeCount             int
+	lastBeginTxReq         *sppb.BeginTransactionRequest
+	lastCommitReq          *sppb.CommitRequest
 
 	// Return values
 	beginTxResp    *sppb.Transaction
@@ -114,12 +117,18 @@ func (m *mockSpannerClient) ExecuteSql(ctx context.Context, req *sppb.ExecuteSql
 func (m *mockSpannerClient) BeginTransaction(ctx context.Context, req *sppb.BeginTransactionRequest, opts ...gax.CallOption) (*sppb.Transaction, error) {
 	m.beginTxCalled = true
 	m.beginTxCount++
+	if req != nil {
+		m.lastBeginTxReq = proto.Clone(req).(*sppb.BeginTransactionRequest)
+	}
 	return m.beginTxResp, nil
 }
 
 func (m *mockSpannerClient) Commit(ctx context.Context, req *sppb.CommitRequest, opts ...gax.CallOption) (*sppb.CommitResponse, error) {
 	m.commitCalled = true
 	m.commitCount++
+	if req != nil {
+		m.lastCommitReq = proto.Clone(req).(*sppb.CommitRequest)
+	}
 	return m.commitResp, nil
 }
 
@@ -283,6 +292,275 @@ func TestLocationAwareSpannerClient_TransactionAffinity_BeginTransaction(t *test
 	// Affinity should be cleared after commit.
 	if router.getTransactionAffinity("tx-123") != nil {
 		t.Fatal("expected transaction affinity to be cleared after Commit")
+	}
+}
+
+func TestLocationAwareSpannerClient_BeginTransactionAddsRoutingHint(t *testing.T) {
+	defaultClient := &mockSpannerClient{
+		beginTxResp: &sppb.Transaction{Id: []byte("tx-begin-hint")},
+	}
+	epCache := newMockEndpointCache()
+	router := newLocationRouter(epCache)
+	router.observeResultSet(&sppb.ResultSet{CacheUpdate: createMutationRoutingCacheUpdate()})
+
+	lac := newLocationAwareSpannerClient(defaultClient, router, epCache)
+	_, err := lac.BeginTransaction(context.Background(), &sppb.BeginTransactionRequest{
+		Session:     "projects/p/instances/i/databases/d/sessions/s",
+		MutationKey: createInsertMutation("b"),
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if defaultClient.lastBeginTxReq == nil {
+		t.Fatal("expected BeginTransaction request to be captured")
+	}
+	hint := defaultClient.lastBeginTxReq.GetRoutingHint()
+	if hint == nil {
+		t.Fatal("expected BeginTransaction routing hint")
+	}
+	if hint.GetDatabaseId() != 7 {
+		t.Fatalf("expected database id 7, got %d", hint.GetDatabaseId())
+	}
+	if string(hint.GetSchemaGeneration()) != "1" {
+		t.Fatalf("expected schema generation 1, got %q", hint.GetSchemaGeneration())
+	}
+	if len(hint.GetKey()) == 0 {
+		t.Fatal("expected BeginTransaction encoded key")
+	}
+}
+
+func TestLocationAwareSpannerClient_TransactionCacheUpdateEnablesCommitRoutingHint(t *testing.T) {
+	defaultClient := &mockSpannerClient{
+		beginTxResp: &sppb.Transaction{
+			Id:          []byte("tx-cache-update"),
+			CacheUpdate: createMutationRoutingCacheUpdate(),
+		},
+		commitResp: &sppb.CommitResponse{},
+	}
+	epCache := newMockEndpointCache()
+	router := newLocationRouter(epCache)
+	lac := newLocationAwareSpannerClient(defaultClient, router, epCache)
+
+	_, err := lac.BeginTransaction(context.Background(), &sppb.BeginTransactionRequest{
+		Session: "projects/p/instances/i/databases/d/sessions/s",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	_, err = lac.Commit(context.Background(), &sppb.CommitRequest{
+		Session: "projects/p/instances/i/databases/d/sessions/s",
+		Transaction: &sppb.CommitRequest_TransactionId{
+			TransactionId: []byte("tx-cache-update"),
+		},
+		Mutations: []*sppb.Mutation{createInsertMutation("b")},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if defaultClient.lastCommitReq == nil {
+		t.Fatal("expected Commit request to be captured")
+	}
+	hint := defaultClient.lastCommitReq.GetRoutingHint()
+	if hint == nil {
+		t.Fatal("expected Commit routing hint")
+	}
+	if hint.GetDatabaseId() != 7 {
+		t.Fatalf("expected database id 7, got %d", hint.GetDatabaseId())
+	}
+	if string(hint.GetSchemaGeneration()) != "1" {
+		t.Fatalf("expected schema generation 1, got %q", hint.GetSchemaGeneration())
+	}
+	if len(hint.GetKey()) == 0 {
+		t.Fatal("expected Commit encoded key")
+	}
+}
+
+func TestLocationAwareSpannerClient_SingleUseCommitRoutesUsingRoutingHint(t *testing.T) {
+	defaultClient := &mockSpannerClient{commitResp: &sppb.CommitResponse{}}
+	endpointClient := &mockSpannerClient{commitResp: &sppb.CommitResponse{}}
+
+	epCache := newMockEndpointCache()
+	epCache.addEndpoint("server-a:443", endpointClient)
+	router := newLocationRouter(epCache)
+	router.observeResultSet(&sppb.ResultSet{CacheUpdate: createMutationRecipeCacheUpdate()})
+
+	lac := newLocationAwareSpannerClient(defaultClient, router, epCache)
+	_, err := lac.Commit(context.Background(), &sppb.CommitRequest{
+		Session: "projects/p/instances/i/databases/d/sessions/s",
+		Transaction: &sppb.CommitRequest_SingleUseTransaction{
+			SingleUseTransaction: &sppb.TransactionOptions{
+				Mode: &sppb.TransactionOptions_ReadWrite_{ReadWrite: &sppb.TransactionOptions_ReadWrite{}},
+			},
+		},
+		Mutations: []*sppb.Mutation{createInsertMutation("b")},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if defaultClient.lastCommitReq == nil {
+		t.Fatal("expected initial Commit request to be captured")
+	}
+	router.observeResultSet(&sppb.ResultSet{CacheUpdate: createRangeCacheUpdateForHint(defaultClient.lastCommitReq.GetRoutingHint())})
+
+	_, err = lac.Commit(context.Background(), &sppb.CommitRequest{
+		Session: "projects/p/instances/i/databases/d/sessions/s",
+		Transaction: &sppb.CommitRequest_SingleUseTransaction{
+			SingleUseTransaction: &sppb.TransactionOptions{
+				Mode: &sppb.TransactionOptions_ReadWrite_{ReadWrite: &sppb.TransactionOptions_ReadWrite{}},
+			},
+		},
+		Mutations: []*sppb.Mutation{createInsertMutation("b")},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if defaultClient.commitCount != 1 {
+		t.Fatalf("expected first Commit to use default client once, got %d", defaultClient.commitCount)
+	}
+	if endpointClient.commitCount != 1 {
+		t.Fatalf("expected second Commit to route to endpoint client once, got %d", endpointClient.commitCount)
+	}
+	if endpointClient.lastCommitReq == nil || endpointClient.lastCommitReq.GetRoutingHint() == nil {
+		t.Fatal("expected routed Commit request to contain a routing hint")
+	}
+}
+
+func TestLocationAwareSpannerClient_SingleUseCommitUsesSameMutationSelectionAsBeginTransaction(t *testing.T) {
+	defaultClient := &mockSpannerClient{
+		beginTxResp: &sppb.Transaction{Id: []byte("tx-selection")},
+		commitResp:  &sppb.CommitResponse{},
+	}
+	epCache := newMockEndpointCache()
+	router := newLocationRouter(epCache)
+	router.observeResultSet(&sppb.ResultSet{CacheUpdate: createMutationRecipeCacheUpdate()})
+
+	lac := newLocationAwareSpannerClient(defaultClient, router, epCache)
+	deleteMutation := createDeleteMutation("b")
+
+	_, err := lac.BeginTransaction(context.Background(), &sppb.BeginTransactionRequest{
+		Session:     "projects/p/instances/i/databases/d/sessions/s",
+		MutationKey: deleteMutation,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if defaultClient.lastBeginTxReq == nil {
+		t.Fatal("expected BeginTransaction request to be captured")
+	}
+	expectedHint := proto.Clone(defaultClient.lastBeginTxReq.GetRoutingHint()).(*sppb.RoutingHint)
+
+	_, err = lac.Commit(context.Background(), &sppb.CommitRequest{
+		Session: "projects/p/instances/i/databases/d/sessions/s",
+		Transaction: &sppb.CommitRequest_SingleUseTransaction{
+			SingleUseTransaction: &sppb.TransactionOptions{
+				Mode: &sppb.TransactionOptions_ReadWrite_{ReadWrite: &sppb.TransactionOptions_ReadWrite{}},
+			},
+		},
+		Mutations: []*sppb.Mutation{
+			createInsertMutation("a"),
+			deleteMutation,
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if defaultClient.lastCommitReq == nil {
+		t.Fatal("expected Commit request to be captured")
+	}
+	if !proto.Equal(expectedHint, defaultClient.lastCommitReq.GetRoutingHint()) {
+		t.Fatalf("expected Commit routing hint %v, got %v", expectedHint, defaultClient.lastCommitReq.GetRoutingHint())
+	}
+}
+
+func TestLocationAwareSpannerClient_CommitWithTransactionIDRoutesUsingRoutingHintWhenAffinityMissing(t *testing.T) {
+	defaultClient := &mockSpannerClient{commitResp: &sppb.CommitResponse{}}
+	endpointClient := &mockSpannerClient{commitResp: &sppb.CommitResponse{}}
+
+	epCache := newMockEndpointCache()
+	epCache.addEndpoint("server-a:443", endpointClient)
+	router := newLocationRouter(epCache)
+	router.observeResultSet(&sppb.ResultSet{CacheUpdate: createMutationRecipeCacheUpdate()})
+
+	lac := newLocationAwareSpannerClient(defaultClient, router, epCache)
+	_, err := lac.Commit(context.Background(), &sppb.CommitRequest{
+		Session: "projects/p/instances/i/databases/d/sessions/s",
+		Transaction: &sppb.CommitRequest_TransactionId{
+			TransactionId: []byte("tx-no-affinity"),
+		},
+		Mutations: []*sppb.Mutation{createInsertMutation("b")},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if defaultClient.lastCommitReq == nil {
+		t.Fatal("expected initial Commit request to be captured")
+	}
+	router.observeResultSet(&sppb.ResultSet{CacheUpdate: createRangeCacheUpdateForHint(defaultClient.lastCommitReq.GetRoutingHint())})
+
+	_, err = lac.Commit(context.Background(), &sppb.CommitRequest{
+		Session: "projects/p/instances/i/databases/d/sessions/s",
+		Transaction: &sppb.CommitRequest_TransactionId{
+			TransactionId: []byte("tx-no-affinity"),
+		},
+		Mutations: []*sppb.Mutation{createInsertMutation("b")},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if defaultClient.commitCount != 1 {
+		t.Fatalf("expected first Commit to use default client once, got %d", defaultClient.commitCount)
+	}
+	if endpointClient.commitCount != 1 {
+		t.Fatalf("expected second Commit to route to endpoint client once, got %d", endpointClient.commitCount)
+	}
+}
+
+func TestLocationAwareSpannerClient_CommitResponseCacheUpdateEnablesSubsequentBeginRoutingHint(t *testing.T) {
+	defaultClient := &mockSpannerClient{
+		beginTxResp: &sppb.Transaction{Id: []byte("tx-commit-update")},
+		commitResp:  &sppb.CommitResponse{CacheUpdate: createMutationRoutingCacheUpdate()},
+	}
+	epCache := newMockEndpointCache()
+	router := newLocationRouter(epCache)
+	lac := newLocationAwareSpannerClient(defaultClient, router, epCache)
+
+	_, err := lac.BeginTransaction(context.Background(), &sppb.BeginTransactionRequest{
+		Session: "projects/p/instances/i/databases/d/sessions/s",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	_, err = lac.Commit(context.Background(), &sppb.CommitRequest{
+		Session: "projects/p/instances/i/databases/d/sessions/s",
+		Transaction: &sppb.CommitRequest_TransactionId{
+			TransactionId: []byte("tx-commit-update"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	_, err = lac.BeginTransaction(context.Background(), &sppb.BeginTransactionRequest{
+		Session:     "projects/p/instances/i/databases/d/sessions/s",
+		MutationKey: createInsertMutation("b"),
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if defaultClient.lastBeginTxReq == nil {
+		t.Fatal("expected BeginTransaction request to be captured")
+	}
+	hint := defaultClient.lastBeginTxReq.GetRoutingHint()
+	if hint == nil {
+		t.Fatal("expected BeginTransaction routing hint after commit cache update")
+	}
+	if hint.GetDatabaseId() != 7 {
+		t.Fatalf("expected database id 7, got %d", hint.GetDatabaseId())
+	}
+	if string(hint.GetSchemaGeneration()) != "1" {
+		t.Fatalf("expected schema generation 1, got %q", hint.GetSchemaGeneration())
+	}
+	if len(hint.GetKey()) == 0 {
+		t.Fatal("expected BeginTransaction encoded key")
 	}
 }
 
@@ -777,6 +1055,105 @@ func seedTwoRangeRoutingCache(router *locationRouter) {
 			},
 		},
 	})
+}
+
+func createMutationRoutingCacheUpdate() *sppb.CacheUpdate {
+	update := proto.Clone(createMutationRecipeCacheUpdate()).(*sppb.CacheUpdate)
+	proto.Merge(update, createRangeCacheUpdateForHint(&sppb.RoutingHint{Key: []byte("a")}))
+	return update
+}
+
+func createMutationRecipeCacheUpdate() *sppb.CacheUpdate {
+	return &sppb.CacheUpdate{
+		DatabaseId: 7,
+		KeyRecipes: &sppb.RecipeList{
+			SchemaGeneration: []byte("1"),
+			Recipe: []*sppb.KeyRecipe{
+				{
+					Target: &sppb.KeyRecipe_TableName{TableName: "T"},
+					Part: []*sppb.KeyRecipe_Part{
+						{Tag: 1},
+						{
+							Order:     sppb.KeyRecipe_Part_ASCENDING,
+							NullOrder: sppb.KeyRecipe_Part_NULLS_FIRST,
+							Type:      &sppb.Type{Code: sppb.TypeCode_STRING},
+							ValueType: &sppb.KeyRecipe_Part_Identifier{Identifier: "k"},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func createRangeCacheUpdateForHint(hint *sppb.RoutingHint) *sppb.CacheUpdate {
+	if hint == nil {
+		hint = &sppb.RoutingHint{}
+	}
+	key := append([]byte(nil), hint.GetKey()...)
+	limitKey := append([]byte(nil), hint.GetLimitKey()...)
+	if len(limitKey) == 0 {
+		limitKey = append(append([]byte(nil), key...), 0)
+	}
+	return &sppb.CacheUpdate{
+		DatabaseId: 7,
+		Range: []*sppb.Range{
+			{
+				StartKey:   key,
+				LimitKey:   limitKey,
+				GroupUid:   1,
+				SplitId:    1,
+				Generation: []byte("1"),
+			},
+		},
+		Group: []*sppb.Group{
+			{
+				GroupUid:   1,
+				Generation: []byte("1"),
+				Tablets: []*sppb.Tablet{
+					{
+						TabletUid:     11,
+						ServerAddress: "server-a:443",
+						Role:          sppb.Tablet_READ_WRITE,
+						Incarnation:   []byte("i"),
+					},
+				},
+			},
+		},
+	}
+}
+
+func createInsertMutation(key string) *sppb.Mutation {
+	return &sppb.Mutation{
+		Operation: &sppb.Mutation_Insert{
+			Insert: &sppb.Mutation_Write{
+				Table:   "T",
+				Columns: []string{"k"},
+				Values: []*structpb.ListValue{
+					{
+						Values: []*structpb.Value{structpb.NewStringValue(key)},
+					},
+				},
+			},
+		},
+	}
+}
+
+func createDeleteMutation(key string) *sppb.Mutation {
+	return &sppb.Mutation{
+		Operation: &sppb.Mutation_Delete_{
+			Delete: &sppb.Mutation_Delete{
+				Table: "T",
+				KeySet: &sppb.KeySet{
+					Keys: []*structpb.ListValue{
+						{
+							Values: []*structpb.Value{structpb.NewStringValue(key)},
+						},
+					},
+				},
+			},
+		},
+	}
 }
 
 func executeSQLWithKeyAndSelector(key string, selector *sppb.TransactionSelector) *sppb.ExecuteSqlRequest {
