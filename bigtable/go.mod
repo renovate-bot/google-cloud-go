@@ -6,6 +6,7 @@ toolchain go1.26.1
 
 require (
 	cloud.google.com/go v0.123.0
+	cloud.google.com/go/compute/metadata v0.9.0
 	cloud.google.com/go/iam v1.5.3
 	cloud.google.com/go/longrunning v0.8.0
 	cloud.google.com/go/monitoring v1.24.3
@@ -33,7 +34,6 @@ require (
 	cel.dev/expr v0.25.1 // indirect
 	cloud.google.com/go/auth v0.18.2 // indirect
 	cloud.google.com/go/auth/oauth2adapt v0.2.8 // indirect
-	cloud.google.com/go/compute/metadata v0.9.0 // indirect
 	github.com/GoogleCloudPlatform/opentelemetry-operations-go/detectors/gcp v1.30.0 // indirect
 	github.com/GoogleCloudPlatform/opentelemetry-operations-go/internal/resourcemapping v0.55.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
