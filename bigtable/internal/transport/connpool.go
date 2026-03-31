@@ -578,10 +578,14 @@ func (p *BigtableChannelPool) checkIfDirectAccessCompatible() (*BigtableConn, bo
 
 	err = conn.Prime(p.poolCtx, p.instanceName, p.appProfile, p.directAccessFeatureFlagsMD)
 	if err != nil {
-		btopt.Debugf(p.logger, "bigtable_connpool: Prime() failed during Direct Access check: %v", err)
-		conn.Close()
-		go p.investigateDirectAccessFailure(err) // Kick off investigation
-		return nil, false
+		// If the error is PermissionDenied, we check ALTS
+		if status.Code(err) != codes.PermissionDenied {
+			btopt.Debugf(p.logger, "bigtable_connpool: Prime() failed during Direct Access check: %v", err)
+			conn.Close()
+			go p.investigateDirectAccessFailure(err)
+			return nil, false
+		}
+		btopt.Debugf(p.logger, "bigtable_connpool: Prime() failed with PermissionDenied, continuing to ALTS check: %v", err)
 	}
 
 	if conn.isALTSConn.Load() {
