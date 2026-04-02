@@ -471,14 +471,19 @@ func addOpenTelemetryStatsHandler(dialOpts []grpc.DialOption, opts *Options, end
 	}
 	var staticAttrs []attribute.KeyValue
 	var scopedLogger *slog.Logger
+
+	if gax.IsFeatureEnabled("LOGGING") && opts.Logger != nil {
+		scopedLogger = opts.Logger
+	}
+
 	if opts.InternalOptions != nil {
 		staticAttrs = transport.StaticTelemetryAttributes(opts.InternalOptions.TelemetryAttributes)
-		if gax.IsFeatureEnabled("LOGGING") && opts.Logger != nil {
+		if scopedLogger != nil {
 			var staticLogAttrs []any
 			for _, attr := range staticAttrs {
 				staticLogAttrs = append(staticLogAttrs, slog.String(string(attr.Key), attr.Value.AsString()))
 			}
-			scopedLogger = opts.Logger.With(staticLogAttrs...)
+			scopedLogger = scopedLogger.With(staticLogAttrs...)
 		}
 	}
 	var otelOpts []otelgrpc.Option
