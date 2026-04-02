@@ -859,6 +859,47 @@ func TestIntegration_PipelineStages(t *testing.T) {
 			t.Errorf("got %d documents, want 4", len(results))
 		}
 	})
+	t.Run("Update", func(t *testing.T) {
+		t.Skip("Skipping test until feature is available in PROD")
+		updateIter := client.Pipeline().Collection(coll.ID).
+			Where(Equal(FieldOf("author.country"), "UK")).
+			Update(WithUpdateTransformations(ConstantOf("Active").As("status"))).
+			Execute(ctx).Results()
+		defer updateIter.Stop()
+		_, err := updateIter.GetAll()
+		if err != nil {
+			t.Fatalf("Failed to execute update: %v", err)
+		}
+
+		verifyIter := client.Pipeline().Collection(coll.ID).Where(Equal(FieldOf("status"), "Active")).Execute(ctx).Results()
+		defer verifyIter.Stop()
+		results, err := verifyIter.GetAll()
+		if err != nil {
+			t.Fatalf("Failed to execute verify: %v", err)
+		}
+		if len(results) != 4 {
+			t.Errorf("got %d updated documents, want 4", len(results))
+		}
+	})
+	t.Run("Delete", func(t *testing.T) {
+		t.Skip("Skipping test until feature is available in PROD")
+		deleteIter := client.Pipeline().Collection(coll.ID).Where(Equal(FieldOf("title"), "The Great Gatsby")).Delete().Execute(ctx).Results()
+		defer deleteIter.Stop()
+		_, err := deleteIter.GetAll()
+		if err != nil {
+			t.Fatalf("Failed to execute delete: %v", err)
+		}
+
+		verifyIter := client.Pipeline().Collection(coll.ID).Where(Equal(FieldOf("title"), "The Great Gatsby")).Execute(ctx).Results()
+		defer verifyIter.Stop()
+		results, err := verifyIter.GetAll()
+		if err != nil {
+			t.Fatalf("Failed to execute verify: %v", err)
+		}
+		if len(results) != 0 {
+			t.Errorf("got %d documents, want 0 after delete", len(results))
+		}
+	})
 }
 
 func TestIntegration_PipelineFunctions(t *testing.T) {

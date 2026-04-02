@@ -434,3 +434,85 @@ func TestPipeline_CreateFromQuery(t *testing.T) {
 		t.Errorf("toExecutePipelineRequest() mismatch for collection stage (-want +got):\n%s", diff)
 	}
 }
+
+func TestPipeline_Update(t *testing.T) {
+	client := newTestClient()
+	ps := &PipelineSource{client: client}
+	p := ps.Collection("users").Update(WithUpdateTransformations(ConstantOf("Active").As("status")))
+
+	req, err := p.toExecutePipelineRequest()
+	if err != nil {
+		t.Fatalf("p.toExecutePipelineRequest() failed: %v", err)
+	}
+
+	stages := req.GetStructuredPipeline().GetPipeline().GetStages()
+	if len(stages) != 2 {
+		t.Fatalf("Expected 2 stages in proto, got %d", len(stages))
+	}
+
+	wantUpdateStage := &pb.Pipeline_Stage{
+		Name: "update",
+		Args: []*pb.Value{
+			{ValueType: &pb.Value_MapValue{
+				MapValue: &pb.MapValue{
+					Fields: map[string]*pb.Value{
+						"status": {ValueType: &pb.Value_StringValue{StringValue: "Active"}},
+					},
+				},
+			}},
+		},
+	}
+	if diff := cmp.Diff(wantUpdateStage, stages[1], protocmp.Transform()); diff != "" {
+		t.Errorf("toExecutePipelineRequest() mismatch for update stage (-want +got):\n%s", diff)
+	}
+}
+
+func TestPipeline_Update_Empty(t *testing.T) {
+	client := newTestClient()
+	ps := &PipelineSource{client: client}
+	p := ps.Collection("users").Update()
+
+	req, err := p.toExecutePipelineRequest()
+	if err != nil {
+		t.Fatalf("p.toExecutePipelineRequest() failed: %v", err)
+	}
+
+	stages := req.GetStructuredPipeline().GetPipeline().GetStages()
+	if len(stages) != 2 {
+		t.Fatalf("Expected 2 stages in proto, got %d", len(stages))
+	}
+
+	wantUpdateStage := &pb.Pipeline_Stage{
+		Name: "update",
+		Args: []*pb.Value{
+			{ValueType: &pb.Value_MapValue{MapValue: &pb.MapValue{}}},
+		},
+	}
+	if diff := cmp.Diff(wantUpdateStage, stages[1], protocmp.Transform()); diff != "" {
+		t.Errorf("toExecutePipelineRequest() mismatch for update stage (empty args) (-want +got):\n%s", diff)
+	}
+}
+
+func TestPipeline_Delete(t *testing.T) {
+	client := newTestClient()
+	ps := &PipelineSource{client: client}
+	p := ps.Collection("users").Delete()
+
+	req, err := p.toExecutePipelineRequest()
+	if err != nil {
+		t.Fatalf("p.toExecutePipelineRequest() failed: %v", err)
+	}
+
+	stages := req.GetStructuredPipeline().GetPipeline().GetStages()
+	if len(stages) != 2 {
+		t.Fatalf("Expected 2 stages in proto, got %d", len(stages))
+	}
+
+	wantDeleteStage := &pb.Pipeline_Stage{
+		Name: "delete",
+		Args: []*pb.Value{},
+	}
+	if diff := cmp.Diff(wantDeleteStage, stages[1], protocmp.Transform()); diff != "" {
+		t.Errorf("toExecutePipelineRequest() mismatch for delete stage (-want +got):\n%s", diff)
+	}
+}

@@ -822,3 +822,94 @@ func (p *Pipeline) RawStage(name string, args []any, opts ...RawStageOptions) *P
 	}
 	return p.append(stage)
 }
+
+// UpdateOption is an option for an Update pipeline stage.
+//
+// Experimental: Firestore Pipelines is currently in preview and is subject to potential breaking changes in future versions,
+// regardless of any other documented package stability guarantees.
+type UpdateOption interface {
+	isUpdateOption()
+}
+
+type updateTransformationsOption struct {
+	fields []Selectable
+}
+
+func (updateTransformationsOption) isUpdateOption() {}
+
+// WithUpdateTransformations specifies the list of field transformations to apply in an update operation.
+//
+// Experimental: Firestore Pipelines is currently in preview and is subject to potential breaking changes in future versions,
+// regardless of any other documented package stability guarantees.
+func WithUpdateTransformations(field Selectable, additionalFields ...Selectable) UpdateOption {
+	return updateTransformationsOption{
+		fields: append([]Selectable{field}, additionalFields...),
+	}
+}
+
+// Update performs an update operation using documents from previous stages.
+//
+// This method updates the documents in place based on the data flowing through the pipeline.
+// You can optionally specify a list of [Selectable] field transformations using [WithUpdateTransformations].
+// If no transformations are provided, it performs the update in-place without any changes.
+//
+// Example:
+//
+//	// In-place update
+//	client.Pipeline().Literals(updateData).Update()
+//
+//	// Update with transformations
+//	client.Pipeline().Collection("books").
+//		Where(GreaterThan("price", 50)).
+//		Update(WithUpdateTransformations(ConstantOf("Discounted").As("status")))
+//
+// Experimental: Firestore Pipelines is currently in preview and is subject to potential breaking changes in future versions,
+// regardless of any other documented package stability guarantees.
+func (p *Pipeline) Update(opts ...UpdateOption) *Pipeline {
+	if p.err != nil {
+		return p
+	}
+
+	var transformations []Selectable
+	for _, opt := range opts {
+		if opt != nil {
+			switch o := opt.(type) {
+			case updateTransformationsOption:
+				transformations = append(transformations, o.fields...)
+			}
+		}
+	}
+
+	stage, err := newUpdateStage(transformations)
+	if err != nil {
+		p.err = err
+		return p
+	}
+	return p.append(stage)
+}
+
+// DeleteOption is an option for a Delete pipeline stage.
+//
+// Experimental: Firestore Pipelines is currently in preview and is subject to potential breaking changes in future versions,
+// regardless of any other documented package stability guarantees.
+type DeleteOption interface {
+	isDeleteOption()
+}
+
+// Delete deletes the documents from previous stages.
+//
+// Example:
+//
+//	client.Pipeline().Collection("logs").
+//		Where(Equal("status", "archived")).
+//		Delete()
+//
+// Experimental: Firestore Pipelines is currently in preview and is subject to potential breaking changes in future versions,
+// regardless of any other documented package stability guarantees.
+func (p *Pipeline) Delete(opts ...DeleteOption) *Pipeline {
+	if p.err != nil {
+		return p
+	}
+	stage := newDeleteStage()
+	return p.append(stage)
+}

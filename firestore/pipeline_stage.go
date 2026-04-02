@@ -42,6 +42,7 @@ const (
 	stageNameCollection      = "collection"
 	stageNameCollectionGroup = "collection_group"
 	stageNameDatabase        = "database"
+	stageNameDelete          = "delete"
 	stageNameDistinct        = "distinct"
 	stageNameDocuments       = "documents"
 	stageNameFindNearest     = "find_nearest"
@@ -52,6 +53,7 @@ const (
 	stageNameSelect          = "select"
 	stageNameUnion           = "union"
 	stageNameUnnest          = "unnest"
+	stageNameUpdate          = "update"
 	stageNameWhere           = "where"
 )
 
@@ -596,5 +598,48 @@ func (s *rawStage) toProto() (*pb.Pipeline_Stage, error) {
 		Name:    s.name(),
 		Args:    argsPb,
 		Options: optionsPb,
+	}, nil
+}
+
+type updateStage struct {
+	fields []Selectable
+}
+
+func newUpdateStage(fields []Selectable) (*updateStage, error) {
+	return &updateStage{fields: fields}, nil
+}
+
+func (s *updateStage) name() string { return stageNameUpdate }
+
+func (s *updateStage) toProto() (*pb.Pipeline_Stage, error) {
+	var mapVal *pb.Value
+	if len(s.fields) > 0 {
+		var err error
+		mapVal, err = projectionsToMapValue(s.fields)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		mapVal = &pb.Value{ValueType: &pb.Value_MapValue{MapValue: &pb.MapValue{}}}
+	}
+
+	return &pb.Pipeline_Stage{
+		Name: s.name(),
+		Args: []*pb.Value{mapVal},
+	}, nil
+}
+
+type deleteStage struct{}
+
+func newDeleteStage() *deleteStage {
+	return &deleteStage{}
+}
+
+func (s *deleteStage) name() string { return stageNameDelete }
+
+func (s *deleteStage) toProto() (*pb.Pipeline_Stage, error) {
+	return &pb.Pipeline_Stage{
+		Name: s.name(),
+		Args: []*pb.Value{},
 	}, nil
 }
