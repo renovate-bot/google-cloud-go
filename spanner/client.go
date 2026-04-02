@@ -564,7 +564,10 @@ func newClientWithConfig(ctx context.Context, database string, config ClientConf
 		fbOpts.EnableFallback = true
 		fbOpts.ErrorRateThreshold = 1
 		fbOpts.MinFailedCalls = 1
-		fbOpts.MeterProvider = config.OpenTelemetryMeterProvider
+
+		if metricsTracerFactory != nil && metricsTracerFactory.meterProvider != nil {
+			fbOpts.MeterProvider = metricsTracerFactory.meterProvider
+		}
 
 		gcpFallback, err := grpcgcp.NewGCPFallback(ctx, primaryConn, fallbackConn, fbOpts)
 		if err != nil {
