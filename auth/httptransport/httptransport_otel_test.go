@@ -18,6 +18,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
@@ -668,4 +669,241 @@ func TestNewClient_OpenTelemetry_Disabled(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTelemetryTransport(t *testing.T) {
+	gax.TestOnlyResetIsFeatureEnabled()
+	defer gax.TestOnlyResetIsFeatureEnabled()
+	t.Setenv("GOOGLE_SDK_GO_EXPERIMENTAL_METRICS", "true")
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	defer ts.Close()
+
+	ctx := context.Background()
+
+	// 1. Setup the TransportTelemetryData
+	data := &gax.TransportTelemetryData{}
+	ctx = gax.InjectTransportTelemetry(ctx, data)
+
+	// 2. Setup the target URL
+	req, err := http.NewRequestWithContext(ctx, "GET", ts.URL, nil)
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+
+	// 3. RoundTrip with otelAttributeTransport
+	base := http.DefaultTransport
+	trans := &otelAttributeTransport{base: base}
+
+	resp, err := trans.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("failed round trip: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// 4. Verify the mutated TransportTelemetryData
+	u, _ := req.URL.Parse(ts.URL)
+	expectedHost := u.Hostname()
+	expectedPort, _ := strconv.Atoi(u.Port())
+
+	if data.ServerAddress() != expectedHost {
+		t.Errorf("expected ServerAddress to be %q, got %q", expectedHost, data.ServerAddress())
+	}
+	if data.ServerPort() != expectedPort {
+		t.Errorf("expected ServerPort to be %d, got %d", expectedPort, data.ServerPort())
+	}
+}
+
+func TestTelemetryTransport_NoTransportTelemetryData(t *testing.T) {
+	gax.TestOnlyResetIsFeatureEnabled()
+	defer gax.TestOnlyResetIsFeatureEnabled()
+	t.Setenv("GOOGLE_SDK_GO_EXPERIMENTAL_METRICS", "true")
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	ctx := context.Background() // No TransportTelemetryData injected
+
+	req, err := http.NewRequestWithContext(ctx, "GET", ts.URL, nil)
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+
+	trans := &otelAttributeTransport{base: http.DefaultTransport}
+
+	resp, err := trans.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("failed round trip: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Should just succeed without panicking and without trying to mutate non-existent data.
+}
+
+func TestNewClient_TracingAndMetrics_Combinations(t *testing.T) {
+	// Ensure any lingering HTTP/2 connections are closed to avoid goroutine leaks.
+	defer http.DefaultTransport.(*http.Transport).CloseIdleConnections()
+
+	exporter := tracetest.NewInMemoryExporter()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+	defer tp.Shutdown(context.Background())
+
+	// Restore the global tracer provider after the test to avoid side effects.
+	defer func(prev oteltrace.TracerProvider) { otel.SetTracerProvider(prev) }(otel.GetTracerProvider())
+	otel.SetTracerProvider(tp)
+
+	tests := []struct {
+		name             string
+		metrics          bool
+		tracing          bool
+		wantMetricsAttrs bool
+		wantTracingAttrs bool
+	}{
+		{
+			name:             "both disabled",
+			metrics:          false,
+			tracing:          false,
+			wantMetricsAttrs: false,
+			wantTracingAttrs: false,
+		},
+		{
+			name:             "tracing enabled, metrics disabled",
+			metrics:          false,
+			tracing:          true,
+			wantMetricsAttrs: false,
+			wantTracingAttrs: true,
+		},
+		{
+			name:             "tracing disabled, metrics enabled",
+			metrics:          true,
+			tracing:          false,
+			wantMetricsAttrs: true,
+			wantTracingAttrs: false,
+		},
+		{
+			name:             "both enabled",
+			metrics:          true,
+			tracing:          true,
+			wantMetricsAttrs: true,
+			wantTracingAttrs: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			exporter.Reset()
+			gax.TestOnlyResetIsFeatureEnabled()
+			defer gax.TestOnlyResetIsFeatureEnabled()
+
+			if tt.metrics {
+				t.Setenv("GOOGLE_SDK_GO_EXPERIMENTAL_METRICS", "true")
+			} else {
+				t.Setenv("GOOGLE_SDK_GO_EXPERIMENTAL_METRICS", "false")
+			}
+			if tt.tracing {
+				t.Setenv("GOOGLE_SDK_GO_EXPERIMENTAL_TRACING", "true")
+			} else {
+				t.Setenv("GOOGLE_SDK_GO_EXPERIMENTAL_TRACING", "false")
+			}
+
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer ts.Close()
+
+			opts := &Options{
+				DisableAuthentication: true,
+				InternalOptions: &InternalOptions{
+					TelemetryAttributes: map[string]string{
+						"gcp.client.version": "1.2.3",
+					},
+				},
+			}
+
+			client, err := NewClient(opts)
+			if err != nil {
+				t.Fatalf("NewClient() = %v, want nil", err)
+			}
+
+			data := &gax.TransportTelemetryData{}
+			ctx := gax.InjectTransportTelemetry(context.Background(), data)
+			req, err := http.NewRequestWithContext(ctx, "GET", ts.URL, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatalf("client.Do() = %v, want nil", err)
+			}
+			resp.Body.Close()
+
+			hasMetricsAttrs := data.ServerAddress() != ""
+			if hasMetricsAttrs != tt.wantMetricsAttrs {
+				t.Errorf("got metrics attrs: %v, want: %v", hasMetricsAttrs, tt.wantMetricsAttrs)
+			}
+
+			spans := exporter.GetSpans()
+			hasTracingAttrs := false
+			for _, span := range spans {
+				for _, attr := range span.Attributes {
+					if attr.Key == "gcp.client.version" && attr.Value.AsString() == "1.2.3" {
+						hasTracingAttrs = true
+						break
+					}
+				}
+			}
+
+			if hasTracingAttrs != tt.wantTracingAttrs {
+				t.Errorf("got tracing attrs: %v, want: %v", hasTracingAttrs, tt.wantTracingAttrs)
+			}
+		})
+	}
+}
+
+func TestTelemetryTransport_ImplicitPort(t *testing.T) {
+	gax.TestOnlyResetIsFeatureEnabled()
+	defer gax.TestOnlyResetIsFeatureEnabled()
+	t.Setenv("GOOGLE_SDK_GO_EXPERIMENTAL_METRICS", "true")
+
+	tests := []struct {
+		urlStr       string
+		expectedPort int
+	}{
+		{"http://example.com/foo", 80},
+		{"https://example.com/bar", 443},
+		{"http://example.com:8080/baz", 8080},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.urlStr, func(t *testing.T) {
+			ctx := context.Background()
+			data := &gax.TransportTelemetryData{}
+			ctx = gax.InjectTransportTelemetry(ctx, data)
+
+			req, err := http.NewRequestWithContext(ctx, "GET", tt.urlStr, nil)
+			if err != nil {
+				t.Fatalf("failed to create request: %v", err)
+			}
+
+			// we just want to test the transport round trip parsing, we mock the base roundtripper
+			base := &mockRoundTripper{}
+			trans := &otelAttributeTransport{base: base}
+
+			_, _ = trans.RoundTrip(req)
+
+			if data.ServerPort() != tt.expectedPort {
+				t.Errorf("for url %q, expected ServerPort to be %d, got %d", tt.urlStr, tt.expectedPort, data.ServerPort())
+			}
+		})
+	}
+}
+
+type mockRoundTripper struct{}
+
+func (m *mockRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return &http.Response{StatusCode: 200}, nil
 }
