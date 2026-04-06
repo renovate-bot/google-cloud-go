@@ -1767,27 +1767,27 @@ func TestQuery_Pipeline(t *testing.T) {
 		{
 			name:    "simple query",
 			query:   coll.Where("f", "==", 1).Limit(10),
-			expPipe: client.Pipeline().Collection("C").Sort(Ordering{Expr: FieldOf("__name__"), Direction: OrderingAsc}).Where(Equal("f", 1)).Limit(10),
+			expPipe: client.Pipeline().Collection("C").Sort(Orders(Ordering{Expr: FieldOf("__name__"), Direction: OrderingAsc})).Where(Equal("f", 1)).Limit(10),
 		},
 		{
 			name:    "query with all clauses",
 			query:   coll.Where("f", ">", 1).OrderBy("f", Asc).Select("f").Offset(1),
-			expPipe: client.Pipeline().Collection("C").Sort(Ordering{Expr: FieldOf("f"), Direction: OrderingAsc}, Ordering{Expr: FieldOf("__name__"), Direction: OrderingAsc}).Where(GreaterThan("f", 1)).Offset(1).Select("f"),
+			expPipe: client.Pipeline().Collection("C").Sort(Orders(Ordering{Expr: FieldOf("f"), Direction: OrderingAsc}, Ordering{Expr: FieldOf("__name__"), Direction: OrderingAsc})).Where(GreaterThan("f", 1)).Offset(1).Select(Fields("f")),
 		},
 		{
 			name:    "query with collection group",
 			query:   client.CollectionGroup("C").Where("f", "==", 1).Limit(10),
-			expPipe: client.Pipeline().CollectionGroup("C").Sort(Ordering{Expr: FieldOf("__name__"), Direction: OrderingAsc}).Where(Equal("f", 1)).Limit(10),
+			expPipe: client.Pipeline().CollectionGroup("C").Sort(Orders(Ordering{Expr: FieldOf("__name__"), Direction: OrderingAsc})).Where(Equal("f", 1)).Limit(10),
 		},
 		{
 			name:    "query with cursor",
 			query:   coll.OrderBy("f", Asc).StartAt(1),
-			expPipe: client.Pipeline().Collection("C").Sort(Ordering{Expr: FieldOf("f"), Direction: OrderingAsc}, Ordering{Expr: FieldOf("__name__"), Direction: OrderingAsc}).Where(GreaterThanOrEqual(FieldPath{"f"}, 1)),
+			expPipe: client.Pipeline().Collection("C").Sort(Orders(Ordering{Expr: FieldOf("f"), Direction: OrderingAsc}, Ordering{Expr: FieldOf("__name__"), Direction: OrderingAsc})).Where(GreaterThanOrEqual(FieldPath{"f"}, 1)),
 		},
 		{
 			name:    "query with findNearest",
 			query:   coll.FindNearest("f", []float32{1, 2, 3}, 5, DistanceMeasureEuclidean, &FindNearestOptions{DistanceResultField: "dist"}).q,
-			expPipe: client.Pipeline().Collection("C").Sort(Ordering{Expr: FieldOf("__name__"), Direction: OrderingAsc}).FindNearest("f", []float32{1, 2, 3}, PipelineDistanceMeasureEuclidean, &PipelineFindNearestOptions{Limit: intptr(5), DistanceField: stringptr("dist")}),
+			expPipe: client.Pipeline().Collection("C").Sort(Orders(Ordering{Expr: FieldOf("__name__"), Direction: OrderingAsc})).FindNearest("f", []float32{1, 2, 3}, PipelineDistanceMeasureEuclidean, RawOptions{"limit": 5, "distance_field": "dist"}),
 		},
 	}
 
@@ -1839,27 +1839,27 @@ func TestAggregationQuery_Pipeline(t *testing.T) {
 		{
 			name:    "simple aggregation query",
 			query:   coll.NewAggregationQuery().WithCount("total"),
-			expPipe: client.Pipeline().Collection("C").Sort(Ordering{Expr: FieldOf("__name__"), Direction: OrderingAsc}).Aggregate(Count(DocumentID).As("total")),
+			expPipe: client.Pipeline().Collection("C").Sort(Orders(Ordering{Expr: FieldOf("__name__"), Direction: OrderingAsc})).Aggregate(Accumulators(Count(DocumentID).As("total"))),
 		},
 		{
 			name:    "aggregation query with where",
 			query:   queryWithWhere.NewAggregationQuery().WithCount("total"),
-			expPipe: client.Pipeline().Collection("C").Sort(Ordering{Expr: FieldOf("__name__"), Direction: OrderingAsc}).Where(Equal("f", 1)).Aggregate(Count(DocumentID).As("total")),
+			expPipe: client.Pipeline().Collection("C").Sort(Orders(Ordering{Expr: FieldOf("__name__"), Direction: OrderingAsc})).Where(Equal("f", 1)).Aggregate(Accumulators(Count(DocumentID).As("total"))),
 		},
 		{
 			name:    "aggregation query with sum",
 			query:   coll.NewAggregationQuery().WithSum("f", "sum_f"),
-			expPipe: client.Pipeline().Collection("C").Sort(Ordering{Expr: FieldOf("__name__"), Direction: OrderingAsc}).Aggregate(Sum("f").As("sum_f")),
+			expPipe: client.Pipeline().Collection("C").Sort(Orders(Ordering{Expr: FieldOf("__name__"), Direction: OrderingAsc})).Aggregate(Accumulators(Sum("f").As("sum_f"))),
 		},
 		{
 			name:    "aggregation query with avg",
 			query:   coll.NewAggregationQuery().WithAvg("f", "avg_f"),
-			expPipe: client.Pipeline().Collection("C").Sort(Ordering{Expr: FieldOf("__name__"), Direction: OrderingAsc}).Aggregate(Average("f").As("avg_f")),
+			expPipe: client.Pipeline().Collection("C").Sort(Orders(Ordering{Expr: FieldOf("__name__"), Direction: OrderingAsc})).Aggregate(Accumulators(Average("f").As("avg_f"))),
 		},
 		{
 			name:    "aggregation query with multiple aggregations",
 			query:   coll.NewAggregationQuery().WithCount("total").WithSum("f", "sum_f"),
-			expPipe: client.Pipeline().Collection("C").Sort(Ordering{Expr: FieldOf("__name__"), Direction: OrderingAsc}).Aggregate(Count(DocumentID).As("total"), Sum("f").As("sum_f")),
+			expPipe: client.Pipeline().Collection("C").Sort(Orders(Ordering{Expr: FieldOf("__name__"), Direction: OrderingAsc})).Aggregate(Accumulators(Count(DocumentID).As("total"), Sum("f").As("sum_f"))),
 		},
 	}
 
@@ -2040,4 +2040,35 @@ func errorsMatch(got, want error) bool {
 		return got == want
 	}
 	return strings.Contains(got.Error(), want.Error())
+}
+
+func TestQuery_AlwaysUseImplicitOrderBy(t *testing.T) {
+	ctx := context.Background()
+	c, err := NewClient(ctx, "project-id")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	q1 := c.Collection("C").Where("a", ">", 1)
+
+	// Without alwaysUseImplicitOrderBy, OrderBy should be empty because there is no cursor
+	proto1, _ := q1.toProto()
+	if len(proto1.OrderBy) != 0 {
+		t.Fatalf("Expected 0 OrderBy clauses, got %d", len(proto1.OrderBy))
+	}
+
+	// With alwaysUseImplicitOrderBy, it should automatically inject the inequality and __name__
+	c.WithAlwaysUseImplicitOrderBy(true)
+	q2 := c.Collection("C").Where("a", ">", 1)
+	proto2, _ := q2.toProto()
+
+	if len(proto2.OrderBy) != 2 {
+		t.Fatalf("Expected 2 OrderBy clauses, got %v", len(proto2.OrderBy))
+	}
+	if proto2.OrderBy[0].GetField().GetFieldPath() != "a" {
+		t.Errorf("Expected first order by to be 'a', got %s", proto2.OrderBy[0].GetField().GetFieldPath())
+	}
+	if proto2.OrderBy[1].GetField().GetFieldPath() != "__name__" {
+		t.Errorf("Expected second order by to be '__name__', got %s", proto2.OrderBy[1].GetField().GetFieldPath())
+	}
 }

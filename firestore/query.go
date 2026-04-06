@@ -1912,7 +1912,7 @@ func (q *Query) toPipeline() *Pipeline {
 		}
 		orders = append(orders, Ordering{Expr: field, Direction: direction})
 	}
-	p = p.Sort(orders...)
+	p = p.Sort(orders)
 	// Combine all filters
 	if len(allFilters) == 1 {
 		p = p.Where(allFilters[0])
@@ -1932,7 +1932,7 @@ func (q *Query) toPipeline() *Pipeline {
 
 	// Select
 	if len(q.selection) > 0 {
-		var fields []interface{}
+		var fields []any
 		for _, s := range q.selection {
 			fp, err := fieldPathFromFieldRef(s)
 			if err != nil {
@@ -1942,7 +1942,7 @@ func (q *Query) toPipeline() *Pipeline {
 			fields = append(fields, fp)
 		}
 		if len(fields) > 0 {
-			p = p.Select(fields[0], fields[1:]...)
+			p = p.Select(fields)
 		}
 	}
 
@@ -1969,21 +1969,17 @@ func (q *Query) toPipeline() *Pipeline {
 			p.err = err
 			return p
 		}
-		var limit *int
+		var opts []FindNearestOption
 		if q.findNearest.Limit != nil {
 			val := int(q.findNearest.Limit.Value)
-			limit = &val
+			opts = append(opts, WithFindNearestLimit(val))
 		}
 
-		var distanceField *string
 		if q.findNearest.DistanceResultField != "" {
-			distanceField = &q.findNearest.DistanceResultField
+			opts = append(opts, WithFindNearestDistanceField(q.findNearest.DistanceResultField))
 		}
 
-		p = p.FindNearest(vectorField, queryVector, measure, &PipelineFindNearestOptions{
-			Limit:         limit,
-			DistanceField: distanceField,
-		})
+		p = p.FindNearest(vectorField, queryVector, measure, opts...)
 	}
 
 	return p
@@ -2199,6 +2195,6 @@ func (aq *AggregationQuery) Pipeline() *Pipeline {
 		aggregations = append(aggregations, agg)
 	}
 
-	p = p.Aggregate(aggregations...)
+	p = p.Aggregate(aggregations)
 	return p
 }

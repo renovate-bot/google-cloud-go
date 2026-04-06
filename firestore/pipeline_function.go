@@ -569,9 +569,10 @@ func ArraySliceLength(exprOrFieldPath any, offset any, length any) Expression {
 //
 // Experimental: Firestore Pipelines is currently in preview and is subject to potential breaking changes in future versions,
 // regardless of any other documented package stability guarantees.
-func ArrayFilter(array any, param string, body BooleanExpression) Expression {
-	return newBaseFunction("array_filter", []Expression{asFieldExpr(array), ConstantOf(param), body})
-}
+// TODO: Uncomment this after fixing the proto representation of this function.
+// func ArrayFilter(array any, param string, body BooleanExpression) Expression {
+// 	return newBaseFunction("array_filter", []Expression{asFieldExpr(array), ConstantOf(param), body})
+// }
 
 // ArrayIndexOf creates an expression that returns the first index of a search value in an array.
 // - exprOrFieldPath can be a field path string, [FieldPath] or an [Expression] that evaluates to an array.

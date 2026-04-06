@@ -204,11 +204,12 @@ type Expression interface {
 	// If the expression resolves to an absent value, it is converted to NULL.
 	// The order of elements in the output array is not stable and shouldn't be relied upon.
 	ArrayAggDistinct() AggregateFunction
+	// TODO: Uncomment this after fixing the proto representation of this function.
 	// ArrayFilter creates an expression for array_filter(array, param, body).
 	//
 	// The parameter 'param' is the name of the parameter to use in the body expression.
 	// The parameter 'body' is the expression to evaluate for each element of the array.
-	ArrayFilter(param string, body BooleanExpression) Expression
+	// ArrayFilter(param string, body BooleanExpression) Expression
 	// LogicalMaximum returns the maximum value of the expression and the specified values.
 	LogicalMaximum(others ...any) Expression
 	// LogicalMinimum returns the minimum value of the expression and the specified values.
@@ -582,9 +583,12 @@ func (b *baseExpression) First() AggregateFunction            { return First(b) 
 func (b *baseExpression) Last() AggregateFunction             { return Last(b) }
 func (b *baseExpression) ArrayAgg() AggregateFunction         { return ArrayAgg(b) }
 func (b *baseExpression) ArrayAggDistinct() AggregateFunction { return ArrayAggDistinct(b) }
-func (b *baseExpression) ArrayFilter(param string, body BooleanExpression) Expression {
-	return ArrayFilter(b, param, body)
-}
+
+// TODO: Uncomment this after fixing the proto representation of this function.
+//
+//	func (b *baseExpression) ArrayFilter(param string, body BooleanExpression) Expression {
+//		return ArrayFilter(b, param, body)
+//	}
 func (b *baseExpression) LogicalMaximum(others ...any) Expression {
 	return LogicalMaximum(b, others...)
 }
