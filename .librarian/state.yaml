@@ -785,7 +785,7 @@ libraries:
       - internal/generated/snippets/commerce/
     tag_format: '{id}/v{version}'
   - id: compute
-    version: 1.58.0
+    version: 1.59.0
     last_generated_commit: ""
     apis:
       - path: google/cloud/compute/v1
