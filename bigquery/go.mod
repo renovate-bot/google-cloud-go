@@ -4,23 +4,23 @@ go 1.25.0
 
 require (
 	cloud.google.com/go v0.123.0
-	cloud.google.com/go/datacatalog v1.27.0
-	cloud.google.com/go/iam v1.7.0
-	cloud.google.com/go/longrunning v0.9.0
-	cloud.google.com/go/storage v1.62.0
+	cloud.google.com/go/datacatalog v1.29.0
+	cloud.google.com/go/iam v1.9.0
+	cloud.google.com/go/longrunning v0.11.0
+	cloud.google.com/go/storage v1.62.1
 	github.com/apache/arrow/go/v15 v15.0.2
 	github.com/google/go-cmp v0.7.0
 	github.com/google/uuid v1.6.0
-	github.com/googleapis/gax-go/v2 v2.21.0
+	github.com/googleapis/gax-go/v2 v2.22.0
 	go.opencensus.io v0.24.0
 	go.opentelemetry.io/otel v1.43.0
 	go.opentelemetry.io/otel/sdk v1.43.0
 	golang.org/x/sync v0.20.0
 	golang.org/x/xerrors v0.0.0-20240903120638-7835f813f4da
-	google.golang.org/api v0.275.0
+	google.golang.org/api v0.276.0
 	google.golang.org/genproto v0.0.0-20260319201613-d00831a3d3e7
-	google.golang.org/genproto/googleapis/api v0.0.0-20260401024825-9d38bb4040a9
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20260401024825-9d38bb4040a9
+	google.golang.org/genproto/googleapis/api v0.0.0-20260414002931-afd174a4e478
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260414002931-afd174a4e478
 	google.golang.org/grpc v1.80.0
 	google.golang.org/protobuf v1.36.11
 )
