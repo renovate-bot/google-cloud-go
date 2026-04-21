@@ -19,6 +19,7 @@ package spanner
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -29,6 +30,7 @@ import (
 type lifecycleTestEndpoint struct {
 	address string
 	conn    *grpc.ClientConn
+	active  atomic.Int64
 }
 
 func (e *lifecycleTestEndpoint) Address() string {
@@ -51,6 +53,18 @@ func (e *lifecycleTestEndpoint) IsTransientFailure() bool {
 
 func (e *lifecycleTestEndpoint) GetConn() *grpc.ClientConn {
 	return e.conn
+}
+
+func (e *lifecycleTestEndpoint) IncrementActiveRequests() {
+	e.active.Add(1)
+}
+
+func (e *lifecycleTestEndpoint) DecrementActiveRequests() {
+	e.active.Add(-1)
+}
+
+func (e *lifecycleTestEndpoint) ActiveRequestCount() int {
+	return int(e.active.Load())
 }
 
 type lifecycleTestCache struct {

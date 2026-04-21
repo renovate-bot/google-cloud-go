@@ -207,23 +207,16 @@ func cloneProto[M interface{ ProtoReflect() protoreflect.Message }](msg M) M {
 }
 
 func (f *channelFinder) findServerRead(ctx context.Context, req *sppb.ReadRequest, preferLeader bool) channelEndpoint {
-	return f.findServerReadWithExclusions(ctx, req, preferLeader, nil)
+	return f.findServerReadWithCooldownTracker(ctx, req, preferLeader, nil)
 }
 
-func (f *channelFinder) findServerReadWithExclusions(ctx context.Context, req *sppb.ReadRequest, preferLeader bool, excludedEndpoints endpointExcluder) channelEndpoint {
-	endpoint, _ := f.findServerReadWithExclusionsAndDetails(ctx, req, preferLeader, excludedEndpoints)
-	return endpoint
-}
-
-func (f *channelFinder) findServerReadWithExclusionsAndDetails(ctx context.Context, req *sppb.ReadRequest, preferLeader bool, excludedEndpoints endpointExcluder) (channelEndpoint, routeSelectionDetails) {
-	details := newRouteSelectionDetails()
+func (f *channelFinder) findServerReadWithCooldownTracker(ctx context.Context, req *sppb.ReadRequest, preferLeader bool, cooldowns *endpointOverloadCooldownTracker) channelEndpoint {
 	if req == nil {
-		details.defaultReasonCode = routeReasonRangeCacheMiss
-		return nil, details
+		return nil
 	}
 	f.recipeCache.computeReadKeys(req)
 	hint := ensureReadRoutingHint(req)
-	return f.fillRoutingHintWithExclusionsAndDetails(ctx, preferLeader, rangeModeCoveringSplit, req.GetDirectedReadOptions(), hint, excludedEndpoints)
+	return f.fillRoutingHintWithCooldownTracker(ctx, preferLeader, rangeModeCoveringSplit, req.GetDirectedReadOptions(), hint, cooldowns)
 }
 
 func (f *channelFinder) findServerReadWithTransaction(ctx context.Context, req *sppb.ReadRequest) channelEndpoint {
@@ -234,23 +227,16 @@ func (f *channelFinder) findServerReadWithTransaction(ctx context.Context, req *
 }
 
 func (f *channelFinder) findServerExecuteSQL(ctx context.Context, req *sppb.ExecuteSqlRequest, preferLeader bool) channelEndpoint {
-	return f.findServerExecuteSQLWithExclusions(ctx, req, preferLeader, nil)
+	return f.findServerExecuteSQLWithCooldownTracker(ctx, req, preferLeader, nil)
 }
 
-func (f *channelFinder) findServerExecuteSQLWithExclusions(ctx context.Context, req *sppb.ExecuteSqlRequest, preferLeader bool, excludedEndpoints endpointExcluder) channelEndpoint {
-	endpoint, _ := f.findServerExecuteSQLWithExclusionsAndDetails(ctx, req, preferLeader, excludedEndpoints)
-	return endpoint
-}
-
-func (f *channelFinder) findServerExecuteSQLWithExclusionsAndDetails(ctx context.Context, req *sppb.ExecuteSqlRequest, preferLeader bool, excludedEndpoints endpointExcluder) (channelEndpoint, routeSelectionDetails) {
-	details := newRouteSelectionDetails()
+func (f *channelFinder) findServerExecuteSQLWithCooldownTracker(ctx context.Context, req *sppb.ExecuteSqlRequest, preferLeader bool, cooldowns *endpointOverloadCooldownTracker) channelEndpoint {
 	if req == nil {
-		details.defaultReasonCode = routeReasonRangeCacheMiss
-		return nil, details
+		return nil
 	}
 	f.recipeCache.computeQueryKeys(req)
 	hint := ensureExecuteSQLRoutingHint(req)
-	return f.fillRoutingHintWithExclusionsAndDetails(ctx, preferLeader, rangeModePickRandom, req.GetDirectedReadOptions(), hint, excludedEndpoints)
+	return f.fillRoutingHintWithCooldownTracker(ctx, preferLeader, rangeModePickRandom, req.GetDirectedReadOptions(), hint, cooldowns)
 }
 
 func (f *channelFinder) findServerExecuteSQLWithTransaction(ctx context.Context, req *sppb.ExecuteSqlRequest) channelEndpoint {
@@ -261,93 +247,62 @@ func (f *channelFinder) findServerExecuteSQLWithTransaction(ctx context.Context,
 }
 
 func (f *channelFinder) findServerBeginTransaction(ctx context.Context, req *sppb.BeginTransactionRequest) channelEndpoint {
-	return f.findServerBeginTransactionWithExclusions(ctx, req, nil)
+	return f.findServerBeginTransactionWithCooldownTracker(ctx, req, nil)
 }
 
-func (f *channelFinder) findServerBeginTransactionWithExclusions(ctx context.Context, req *sppb.BeginTransactionRequest, excludedEndpoints endpointExcluder) channelEndpoint {
-	endpoint, _ := f.findServerBeginTransactionWithExclusionsAndDetails(ctx, req, excludedEndpoints)
-	return endpoint
-}
-
-func (f *channelFinder) findServerBeginTransactionWithExclusionsAndDetails(ctx context.Context, req *sppb.BeginTransactionRequest, excludedEndpoints endpointExcluder) (channelEndpoint, routeSelectionDetails) {
-	details := newRouteSelectionDetails()
+func (f *channelFinder) findServerBeginTransactionWithCooldownTracker(ctx context.Context, req *sppb.BeginTransactionRequest, cooldowns *endpointOverloadCooldownTracker) channelEndpoint {
 	if req == nil || req.GetMutationKey() == nil {
-		details.defaultReasonCode = routeReasonRangeCacheMiss
-		return nil, details
+		return nil
 	}
-	return f.routeMutationWithExclusionsAndDetails(ctx, req.GetMutationKey(), preferLeaderFromTransactionOptions(req.GetOptions()), ensureBeginTransactionRoutingHint(req), excludedEndpoints)
+	return f.routeMutationWithCooldownTracker(ctx, req.GetMutationKey(), preferLeaderFromTransactionOptions(req.GetOptions()), ensureBeginTransactionRoutingHint(req), cooldowns)
 }
 
 func (f *channelFinder) fillCommitRoutingHint(ctx context.Context, req *sppb.CommitRequest) channelEndpoint {
-	return f.fillCommitRoutingHintWithExclusions(ctx, req, nil)
+	return f.fillCommitRoutingHintWithCooldownTracker(ctx, req, nil)
 }
 
-func (f *channelFinder) fillCommitRoutingHintWithExclusions(ctx context.Context, req *sppb.CommitRequest, excludedEndpoints endpointExcluder) channelEndpoint {
-	endpoint, _ := f.fillCommitRoutingHintWithExclusionsAndDetails(ctx, req, excludedEndpoints)
-	return endpoint
-}
-
-func (f *channelFinder) fillCommitRoutingHintWithExclusionsAndDetails(ctx context.Context, req *sppb.CommitRequest, excludedEndpoints endpointExcluder) (channelEndpoint, routeSelectionDetails) {
-	details := newRouteSelectionDetails()
+func (f *channelFinder) fillCommitRoutingHintWithCooldownTracker(ctx context.Context, req *sppb.CommitRequest, cooldowns *endpointOverloadCooldownTracker) channelEndpoint {
 	if req == nil {
-		details.defaultReasonCode = routeReasonRangeCacheMiss
-		return nil, details
+		return nil
 	}
 	mutation := selectMutationProtoForRouting(req.GetMutations())
 	if mutation == nil {
-		details.defaultReasonCode = routeReasonRangeCacheMiss
-		return nil, details
+		return nil
 	}
-	return f.routeMutationWithExclusionsAndDetails(ctx, mutation, true, ensureCommitRoutingHint(req), excludedEndpoints)
+	return f.routeMutationWithCooldownTracker(ctx, mutation, true, ensureCommitRoutingHint(req), cooldowns)
 }
 
 func (f *channelFinder) routeMutation(ctx context.Context, mutation *sppb.Mutation, preferLeader bool, hint *sppb.RoutingHint) channelEndpoint {
-	return f.routeMutationWithExclusions(ctx, mutation, preferLeader, hint, nil)
+	return f.routeMutationWithCooldownTracker(ctx, mutation, preferLeader, hint, nil)
 }
 
-func (f *channelFinder) routeMutationWithExclusions(ctx context.Context, mutation *sppb.Mutation, preferLeader bool, hint *sppb.RoutingHint, excludedEndpoints endpointExcluder) channelEndpoint {
-	endpoint, _ := f.routeMutationWithExclusionsAndDetails(ctx, mutation, preferLeader, hint, excludedEndpoints)
-	return endpoint
-}
-
-func (f *channelFinder) routeMutationWithExclusionsAndDetails(ctx context.Context, mutation *sppb.Mutation, preferLeader bool, hint *sppb.RoutingHint, excludedEndpoints endpointExcluder) (channelEndpoint, routeSelectionDetails) {
-	details := newRouteSelectionDetails()
+func (f *channelFinder) routeMutationWithCooldownTracker(ctx context.Context, mutation *sppb.Mutation, preferLeader bool, hint *sppb.RoutingHint, cooldowns *endpointOverloadCooldownTracker) channelEndpoint {
 	if mutation == nil || hint == nil {
-		details.defaultReasonCode = routeReasonRangeCacheMiss
-		return nil, details
+		return nil
 	}
 	f.recipeCache.applySchemaGeneration(hint)
 	target := f.recipeCache.mutationToTargetRange(mutation)
 	if target == nil {
-		details.defaultReasonCode = routeReasonRangeCacheMiss
-		return nil, details
+		return nil
 	}
 	f.recipeCache.applyTargetRange(hint, target)
-	return f.fillRoutingHintWithExclusionsAndDetails(ctx, preferLeader, rangeModeCoveringSplit, &sppb.DirectedReadOptions{}, hint, excludedEndpoints)
+	return f.fillRoutingHintWithCooldownTracker(ctx, preferLeader, rangeModeCoveringSplit, &sppb.DirectedReadOptions{}, hint, cooldowns)
 }
 
 func (f *channelFinder) fillRoutingHint(ctx context.Context, preferLeader bool, mode rangeMode, directedReadOptions *sppb.DirectedReadOptions, hint *sppb.RoutingHint) channelEndpoint {
-	return f.fillRoutingHintWithExclusions(ctx, preferLeader, mode, directedReadOptions, hint, nil)
+	return f.fillRoutingHintWithCooldownTracker(ctx, preferLeader, mode, directedReadOptions, hint, nil)
 }
 
-func (f *channelFinder) fillRoutingHintWithExclusions(ctx context.Context, preferLeader bool, mode rangeMode, directedReadOptions *sppb.DirectedReadOptions, hint *sppb.RoutingHint, excludedEndpoints endpointExcluder) channelEndpoint {
-	endpoint, _ := f.fillRoutingHintWithExclusionsAndDetails(ctx, preferLeader, mode, directedReadOptions, hint, excludedEndpoints)
-	return endpoint
-}
-
-func (f *channelFinder) fillRoutingHintWithExclusionsAndDetails(ctx context.Context, preferLeader bool, mode rangeMode, directedReadOptions *sppb.DirectedReadOptions, hint *sppb.RoutingHint, excludedEndpoints endpointExcluder) (channelEndpoint, routeSelectionDetails) {
-	details := newRouteSelectionDetails()
+func (f *channelFinder) fillRoutingHintWithCooldownTracker(ctx context.Context, preferLeader bool, mode rangeMode, directedReadOptions *sppb.DirectedReadOptions, hint *sppb.RoutingHint, cooldowns *endpointOverloadCooldownTracker) channelEndpoint {
 	if hint == nil {
-		details.defaultReasonCode = routeReasonRangeCacheMiss
-		return nil, details
+		return nil
 	}
 	databaseID := f.databaseID.Load()
 	if databaseID == 0 {
-		details.defaultReasonCode = routeReasonRangeCacheMiss
-		return nil, details
+		return nil
 	}
 	hint.DatabaseId = databaseID
-	return f.rangeCache.fillRoutingHintWithExclusionsAndDetails(ctx, preferLeader, mode, directedReadOptions, hint, excludedEndpoints)
+	return f.rangeCache.fillRoutingHintWithCooldownTracker(ctx, preferLeader, mode, directedReadOptions, hint, cooldowns)
 }
 
 func preferLeaderFromSelector(selector *sppb.TransactionSelector) bool {

@@ -19,6 +19,7 @@ package spanner
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -32,6 +33,7 @@ type testEndpoint struct {
 	healthy          bool
 	transientFailure bool
 	conn             *grpc.ClientConn
+	active           atomic.Int64
 }
 
 func (e *testEndpoint) Address() string {
@@ -54,6 +56,18 @@ func (e *testEndpoint) IsTransientFailure() bool {
 
 func (e *testEndpoint) GetConn() *grpc.ClientConn {
 	return e.conn
+}
+
+func (e *testEndpoint) IncrementActiveRequests() {
+	e.active.Add(1)
+}
+
+func (e *testEndpoint) DecrementActiveRequests() {
+	e.active.Add(-1)
+}
+
+func (e *testEndpoint) ActiveRequestCount() int {
+	return int(e.active.Load())
 }
 
 type testEndpointCache struct {
@@ -469,44 +483,40 @@ func TestKeyRangeCache_FillRoutingHintWithDetailsTracksSelectionAndSkipReasons(t
 	endpointCache.setHealthy("server-first", false)
 	endpointCache.setHealthy("server-transient", false)
 	endpointCache.setTransientFailure("server-transient", true)
+	cooldowns := newEndpointOverloadCooldownTrackerWithOptions(
+		time.Minute,
+		time.Minute,
+		10*time.Minute,
+		time.Now,
+		func(n int64) int64 { return n - 1 },
+	)
+	cooldowns.recordFailure("server-excluded")
 
 	hint := &sppb.RoutingHint{Key: []byte("a")}
-	endpoint, details := cache.fillRoutingHintWithExclusionsAndDetails(
+	endpoint := cache.fillRoutingHintWithCooldownTracker(
 		context.Background(),
 		false,
 		rangeModeCoveringSplit,
 		&sppb.DirectedReadOptions{},
 		hint,
-		func(address string) bool { return address == "server-excluded" },
+		cooldowns,
 	)
 
 	if endpoint == nil || endpoint.Address() != "server-leader" {
 		t.Fatalf("expected server-leader endpoint, got %#v", endpoint)
 	}
-	if !details.selectedIsLeader {
-		t.Fatal("expected selected endpoint to be marked as leader")
+	if got, want := len(hint.GetSkippedTabletUid()), 1; got != want {
+		t.Fatalf("len(skippedTabletUid)=%d, want %d", got, want)
 	}
-	if details.selectedIsFirstReplica {
-		t.Fatal("did not expect selected endpoint to be marked as first replica")
-	}
-	if got, want := details.selectedEndpoint, "server-leader"; got != want {
-		t.Fatalf("selectedEndpoint=%q, want %q", got, want)
-	}
-	if got, want := details.notReadySkipList(), []string{"server-first"}; fmt.Sprint(got) != fmt.Sprint(want) {
-		t.Fatalf("notReadySkipList=%v, want %v", got, want)
-	}
-	if got, want := details.transientFailureSkipList(), []string{"server-transient"}; fmt.Sprint(got) != fmt.Sprint(want) {
-		t.Fatalf("transientFailureSkipList=%v, want %v", got, want)
-	}
-	if got, want := details.resourceExhaustedExclusionList(), []string{"server-excluded"}; fmt.Sprint(got) != fmt.Sprint(want) {
-		t.Fatalf("resourceExhaustedExclusionList=%v, want %v", got, want)
+	if got, want := hint.GetSkippedTabletUid()[0].GetTabletUid(), uint64(3); got != want {
+		t.Fatalf("skippedTabletUid[0]=%d, want %d", got, want)
 	}
 }
 
-func TestKeyRangeCache_FillRoutingHintWithDetailsMarksCacheMiss(t *testing.T) {
+func TestKeyRangeCache_FillRoutingHintReturnsNilOnCacheMiss(t *testing.T) {
 	cache := newKeyRangeCache(newPassthroughChannelEndpointCache())
 
-	endpoint, details := cache.fillRoutingHintWithExclusionsAndDetails(
+	endpoint := cache.fillRoutingHintWithCooldownTracker(
 		context.Background(),
 		false,
 		rangeModeCoveringSplit,
@@ -517,9 +527,6 @@ func TestKeyRangeCache_FillRoutingHintWithDetailsMarksCacheMiss(t *testing.T) {
 
 	if endpoint != nil {
 		t.Fatalf("expected nil endpoint on cache miss, got %#v", endpoint)
-	}
-	if got, want := details.defaultReasonCode, routeReasonRangeCacheMiss; got != want {
-		t.Fatalf("defaultReasonCode=%q, want %q", got, want)
 	}
 }
 

@@ -21,6 +21,7 @@ import (
 	"context"
 	"io"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -197,6 +198,7 @@ type mockEndpoint struct {
 	address string
 	healthy bool
 	conn    *grpc.ClientConn
+	active  atomic.Int64
 }
 
 func (e *mockEndpoint) Address() string {
@@ -213,6 +215,18 @@ func (*mockEndpoint) IsTransientFailure() bool {
 
 func (e *mockEndpoint) GetConn() *grpc.ClientConn {
 	return e.conn
+}
+
+func (e *mockEndpoint) IncrementActiveRequests() {
+	e.active.Add(1)
+}
+
+func (e *mockEndpoint) DecrementActiveRequests() {
+	e.active.Add(-1)
+}
+
+func (e *mockEndpoint) ActiveRequestCount() int {
+	return int(e.active.Load())
 }
 
 // mockEndpointCache implements channelEndpointCache for testing.
@@ -365,67 +379,103 @@ func TestLocationAwareSpannerClient_UsesCacheDefaultChannelForAffinityFallback(t
 	}
 }
 
-func TestLocationAwareSpannerClient_ExecuteSQLRetriesInternallyAvoidExcludedEndpoint(t *testing.T) {
+func TestLocationAwareSpannerClient_ExecuteSQLReroutesOnResourceExhaustedAndMarksCooldownScopes(t *testing.T) {
+	withIsolatedEndpointLatencyRegistry(t)
+
 	defaultClient := &mockSpannerClient{
 		executeSQLResp: &sppb.ResultSet{},
 	}
-	endpointClient := &mockSpannerClient{
+	endpointClientA := &mockSpannerClient{
 		executeSQLErr: status.Error(codes.ResourceExhausted, "busy"),
+	}
+	endpointClientB := &mockSpannerClient{
+		executeSQLResp: &sppb.ResultSet{},
 	}
 
 	epCache := newMockEndpointCache()
 	epCache.defaultEndpoint = &passthroughChannelEndpoint{address: "default:443"}
-	epCache.addEndpoint("server-a:443", endpointClient)
+	epCache.addEndpoint("server-a:443", endpointClientA)
+	epCache.addEndpoint("server-b:443", endpointClientB)
 	router := newLocationRouter(epCache)
-	router.observeResultSet(&sppb.ResultSet{CacheUpdate: createRangeCacheUpdateForHint(&sppb.RoutingHint{Key: []byte("b")})})
+	update := createRangeCacheUpdateForHint(&sppb.RoutingHint{Key: []byte("b")})
+	update.Group[0].Tablets[0].ServerAddress = "server-a:443"
+	update.Group[0].Tablets = append(update.Group[0].Tablets, &sppb.Tablet{
+		TabletUid:     12,
+		ServerAddress: "server-b:443",
+		Role:          sppb.Tablet_READ_WRITE,
+		Incarnation:   []byte("i2"),
+	})
+	router.observeResultSet(&sppb.ResultSet{CacheUpdate: update})
 	waitForAsyncRoutingUpdate(t, func() bool {
 		req := executeSQLWithKeyAndSelector("b", nil)
 		return router.prepareExecuteSQLRequest(context.Background(), req) != nil
 	})
 
 	lac := newLocationAwareSpannerClient(defaultClient, router, epCache)
+	clock := newLifecycleTestClock(time.Unix(100, 0))
+	lac.endpointCooldowns = newEndpointOverloadCooldownTrackerWithOptions(time.Minute, time.Minute, 10*time.Minute, clock.Now, func(n int64) int64 {
+		return n - 1
+	})
 
 	opts := testCallOptionsWithRequestID("1.proc.1.1.77.1")
-	_, err := lac.ExecuteSql(
+	resp, err := lac.ExecuteSql(
 		context.Background(),
 		executeSQLWithKeyAndSelector("b", nil),
 		opts...,
 	)
 	if err != nil {
-		t.Fatalf("unexpected retry error: %v", err)
+		t.Fatalf("ExecuteSql() returned unexpected error: %v", err)
 	}
-	if endpointClient.executeSQLCount != 1 {
-		t.Fatalf("expected first attempt to hit routed endpoint once, got %d", endpointClient.executeSQLCount)
+	if resp == nil {
+		t.Fatal("ExecuteSql() returned nil response")
 	}
-	if defaultClient.executeSQLCount != 1 {
-		t.Fatalf("expected retry attempt to fall back to default endpoint once, got %d", defaultClient.executeSQLCount)
+	if endpointClientA.executeSQLCount != 1 {
+		t.Fatalf("expected first attempt to hit routed endpoint once, got %d", endpointClientA.executeSQLCount)
 	}
-	logicalRequestKey := logicalRequestKeyFromCallOptions(opts)
-	excluded := lac.excludedEndpoints.consume(logicalRequestKey)
-	if excluded != nil && excluded("server-a:443") {
-		t.Fatal("expected internal retry not to populate endpoint exclusion cache")
+	if endpointClientB.executeSQLCount != 1 {
+		t.Fatalf("expected rerouted attempt to hit alternate endpoint once, got %d", endpointClientB.executeSQLCount)
 	}
-	if got, want := requestIDFromTestCallOptions(endpointClient.executeSQLOptsHistory[0]), "1.proc.1.1.77.1"; got != want {
+	if defaultClient.executeSQLCount != 0 {
+		t.Fatalf("expected no fallback to default endpoint, got %d", defaultClient.executeSQLCount)
+	}
+	if got, want := requestIDFromTestCallOptions(endpointClientA.executeSQLOptsHistory[0]), "1.proc.1.1.77.1"; got != want {
 		t.Fatalf("first attempt request ID = %q, want %q", got, want)
 	}
-	if got, want := requestIDFromTestCallOptions(defaultClient.executeSQLOptsHistory[0]), "1.proc.1.1.77.2"; got != want {
-		t.Fatalf("retry attempt request ID = %q, want %q", got, want)
+	if got, want := requestIDFromTestCallOptions(endpointClientB.executeSQLOptsHistory[0]), "1.proc.1.1.77.2"; got != want {
+		t.Fatalf("reroute attempt request ID = %q, want %q", got, want)
+	}
+	if !lac.endpointCooldowns.isCoolingDown("server-a:443") {
+		t.Fatal("expected routed endpoint to enter cooldown after RESOURCE_EXHAUSTED")
 	}
 }
 
-func TestLocationAwareSpannerClient_ReadRetriesInternallyAvoidExcludedEndpoint(t *testing.T) {
+func TestLocationAwareSpannerClient_ReadReroutesOnResourceExhaustedAndMarksCooldownScopes(t *testing.T) {
+	withIsolatedEndpointLatencyRegistry(t)
+
 	defaultClient := &mockSpannerClient{
 		readResp: &sppb.ResultSet{},
 	}
-	endpointClient := &mockSpannerClient{
+	endpointClientA := &mockSpannerClient{
 		readErr: status.Error(codes.ResourceExhausted, "busy"),
+	}
+	endpointClientB := &mockSpannerClient{
+		readResp: &sppb.ResultSet{},
 	}
 
 	epCache := newMockEndpointCache()
 	epCache.defaultEndpoint = &passthroughChannelEndpoint{address: "default:443"}
-	epCache.addEndpoint("server-a:443", endpointClient)
+	epCache.addEndpoint("server-a:443", endpointClientA)
+	epCache.addEndpoint("server-b:443", endpointClientB)
 	router := newLocationRouter(epCache)
-	router.observeResultSet(&sppb.ResultSet{CacheUpdate: createRangeCacheUpdateForHint(&sppb.RoutingHint{Key: []byte("b")})})
+	update := createRangeCacheUpdateForHint(&sppb.RoutingHint{Key: []byte("b")})
+	update.Group[0].Tablets[0].ServerAddress = "server-a:443"
+	update.Group[0].Tablets = append(update.Group[0].Tablets, &sppb.Tablet{
+		TabletUid:     12,
+		ServerAddress: "server-b:443",
+		Role:          sppb.Tablet_READ_WRITE,
+		Incarnation:   []byte("i2"),
+	})
+	router.observeResultSet(&sppb.ResultSet{CacheUpdate: update})
 	waitForAsyncRoutingUpdate(t, func() bool {
 		req := &sppb.ReadRequest{
 			Session:     "projects/p/instances/i/databases/d/sessions/s",
@@ -437,46 +487,58 @@ func TestLocationAwareSpannerClient_ReadRetriesInternallyAvoidExcludedEndpoint(t
 	})
 
 	lac := newLocationAwareSpannerClient(defaultClient, router, epCache)
+	clock := newLifecycleTestClock(time.Unix(100, 0))
+	lac.endpointCooldowns = newEndpointOverloadCooldownTrackerWithOptions(time.Minute, time.Minute, 10*time.Minute, clock.Now, func(n int64) int64 {
+		return n - 1
+	})
 	opts := testCallOptionsWithRequestID("1.proc.1.1.78.1")
-	_, err := lac.Read(context.Background(), &sppb.ReadRequest{
+	resp, err := lac.Read(context.Background(), &sppb.ReadRequest{
 		Session:     "projects/p/instances/i/databases/d/sessions/s",
 		Table:       "BAR",
 		Columns:     []string{"FOO"},
 		RoutingHint: &sppb.RoutingHint{Key: []byte("b")},
 	}, opts...)
 	if err != nil {
-		t.Fatalf("unexpected retry error: %v", err)
+		t.Fatalf("Read() returned unexpected error: %v", err)
 	}
-	if endpointClient.readCount != 1 {
-		t.Fatalf("expected first attempt to hit routed endpoint once, got %d", endpointClient.readCount)
+	if resp == nil {
+		t.Fatal("Read() returned nil response")
 	}
-	if defaultClient.readCount != 1 {
-		t.Fatalf("expected retry attempt to fall back to default endpoint once, got %d", defaultClient.readCount)
+	if endpointClientA.readCount != 1 {
+		t.Fatalf("expected first attempt to hit routed endpoint once, got %d", endpointClientA.readCount)
 	}
-	logicalRequestKey := logicalRequestKeyFromCallOptions(opts)
-	excluded := lac.excludedEndpoints.consume(logicalRequestKey)
-	if excluded != nil && excluded("server-a:443") {
-		t.Fatal("expected internal retry not to populate endpoint exclusion cache")
+	if endpointClientB.readCount != 1 {
+		t.Fatalf("expected rerouted attempt to hit alternate endpoint once, got %d", endpointClientB.readCount)
 	}
-	if got, want := requestIDFromTestCallOptions(endpointClient.readOptsHistory[0]), "1.proc.1.1.78.1"; got != want {
+	if defaultClient.readCount != 0 {
+		t.Fatalf("expected no fallback to default endpoint, got %d", defaultClient.readCount)
+	}
+	if got, want := requestIDFromTestCallOptions(endpointClientA.readOptsHistory[0]), "1.proc.1.1.78.1"; got != want {
 		t.Fatalf("first attempt request ID = %q, want %q", got, want)
 	}
-	if got, want := requestIDFromTestCallOptions(defaultClient.readOptsHistory[0]), "1.proc.1.1.78.2"; got != want {
-		t.Fatalf("retry attempt request ID = %q, want %q", got, want)
+	if got, want := requestIDFromTestCallOptions(endpointClientB.readOptsHistory[0]), "1.proc.1.1.78.2"; got != want {
+		t.Fatalf("reroute attempt request ID = %q, want %q", got, want)
+	}
+	if !lac.endpointCooldowns.isCoolingDown("server-a:443") {
+		t.Fatal("expected routed endpoint to enter cooldown after RESOURCE_EXHAUSTED")
 	}
 }
 
-func TestLocationAwareSpannerClient_BeginTransactionRetriesInternallyAvoidExcludedEndpoint(t *testing.T) {
+func TestLocationAwareSpannerClient_BeginTransactionReroutesOnResourceExhaustedAndMarksCooldownScopes(t *testing.T) {
 	defaultClient := &mockSpannerClient{
 		beginTxResp: &sppb.Transaction{Id: []byte("tx-default")},
 	}
-	endpointClient := &mockSpannerClient{
+	endpointClientA := &mockSpannerClient{
 		beginTxErr: status.Error(codes.ResourceExhausted, "busy"),
+	}
+	endpointClientB := &mockSpannerClient{
+		beginTxResp: &sppb.Transaction{Id: []byte("tx-alt")},
 	}
 
 	epCache := newMockEndpointCache()
 	epCache.defaultEndpoint = &passthroughChannelEndpoint{address: "default:443"}
-	epCache.addEndpoint("server-a:443", endpointClient)
+	epCache.addEndpoint("server-a:443", endpointClientA)
+	epCache.addEndpoint("server-b:443", endpointClientB)
 	router := newLocationRouter(epCache)
 	router.observeResultSet(&sppb.ResultSet{CacheUpdate: createMutationRecipeCacheUpdate()})
 	var routingHint *sppb.RoutingHint
@@ -495,6 +557,12 @@ func TestLocationAwareSpannerClient_BeginTransactionRetriesInternallyAvoidExclud
 	})
 	rangeUpdate := createRangeCacheUpdateForHint(routingHint)
 	rangeUpdate.Group[0].Tablets[0].ServerAddress = "server-a:443"
+	rangeUpdate.Group[0].Tablets = append(rangeUpdate.Group[0].Tablets, &sppb.Tablet{
+		TabletUid:     12,
+		ServerAddress: "server-b:443",
+		Role:          sppb.Tablet_READ_WRITE,
+		Incarnation:   []byte("i2"),
+	})
 	router.observeResultSet(&sppb.ResultSet{CacheUpdate: rangeUpdate})
 	waitForAsyncRoutingUpdate(t, func() bool {
 		req := &sppb.BeginTransactionRequest{
@@ -505,50 +573,72 @@ func TestLocationAwareSpannerClient_BeginTransactionRetriesInternallyAvoidExclud
 	})
 
 	lac := newLocationAwareSpannerClient(defaultClient, router, epCache)
+	clock := newLifecycleTestClock(time.Unix(100, 0))
+	lac.endpointCooldowns = newEndpointOverloadCooldownTrackerWithOptions(time.Minute, time.Minute, 10*time.Minute, clock.Now, func(n int64) int64 {
+		return n - 1
+	})
 	opts := testCallOptionsWithRequestID("1.proc.1.1.79.1")
-	_, err := lac.BeginTransaction(context.Background(), &sppb.BeginTransactionRequest{
+	resp, err := lac.BeginTransaction(context.Background(), &sppb.BeginTransactionRequest{
 		Session:     "projects/p/instances/i/databases/d/sessions/s",
 		MutationKey: createInsertMutation("a"),
 	}, opts...)
 	if err != nil {
-		t.Fatalf("unexpected retry error: %v", err)
+		t.Fatalf("BeginTransaction() returned unexpected error: %v", err)
 	}
-	if endpointClient.beginTxCount != 1 {
-		t.Fatalf("expected first attempt to hit routed endpoint once, got %d", endpointClient.beginTxCount)
+	if resp == nil {
+		t.Fatal("BeginTransaction() returned nil response")
 	}
-	if defaultClient.beginTxCount != 1 {
-		t.Fatalf("expected retry attempt to fall back to default endpoint once, got %d", defaultClient.beginTxCount)
+	if endpointClientA.beginTxCount != 1 {
+		t.Fatalf("expected first attempt to hit routed endpoint once, got %d", endpointClientA.beginTxCount)
 	}
-	logicalRequestKey := logicalRequestKeyFromCallOptions(opts)
-	excluded := lac.excludedEndpoints.consume(logicalRequestKey)
-	if excluded != nil && excluded("server-a:443") {
-		t.Fatal("expected internal retry not to populate endpoint exclusion cache")
+	if endpointClientB.beginTxCount != 1 {
+		t.Fatalf("expected rerouted attempt to hit alternate endpoint once, got %d", endpointClientB.beginTxCount)
 	}
-	if got, want := requestIDFromTestCallOptions(endpointClient.beginTxOptsHistory[0]), "1.proc.1.1.79.1"; got != want {
+	if defaultClient.beginTxCount != 0 {
+		t.Fatalf("expected no fallback to default endpoint, got %d", defaultClient.beginTxCount)
+	}
+	if got, want := requestIDFromTestCallOptions(endpointClientA.beginTxOptsHistory[0]), "1.proc.1.1.79.1"; got != want {
 		t.Fatalf("first attempt request ID = %q, want %q", got, want)
 	}
-	if got, want := requestIDFromTestCallOptions(defaultClient.beginTxOptsHistory[0]), "1.proc.1.1.79.2"; got != want {
-		t.Fatalf("retry attempt request ID = %q, want %q", got, want)
+	if got, want := requestIDFromTestCallOptions(endpointClientB.beginTxOptsHistory[0]), "1.proc.1.1.79.2"; got != want {
+		t.Fatalf("reroute attempt request ID = %q, want %q", got, want)
+	}
+	if !lac.endpointCooldowns.isCoolingDown("server-a:443") {
+		t.Fatal("expected routed endpoint to enter cooldown after RESOURCE_EXHAUSTED")
 	}
 }
 
-func TestLocationAwareSpannerClient_ExecuteStreamingSQLRetriesAvoidExcludedEndpoint(t *testing.T) {
+func TestLocationAwareSpannerClient_ExecuteStreamingSQLNextCallSkipsExcludedEndpoint(t *testing.T) {
 	defaultClient := &mockSpannerClient{
 		streamResp: &mockStreamingClient{
 			results: []*sppb.PartialResultSet{{}},
 		},
 	}
-	endpointClient := &mockSpannerClient{
+	endpointClientA := &mockSpannerClient{
 		streamResp: &mockStreamingClient{
 			err: status.Error(codes.ResourceExhausted, "busy"),
+		},
+	}
+	endpointClientB := &mockSpannerClient{
+		streamResp: &mockStreamingClient{
+			results: []*sppb.PartialResultSet{{}},
 		},
 	}
 
 	epCache := newMockEndpointCache()
 	epCache.defaultEndpoint = &passthroughChannelEndpoint{address: "default:443"}
-	epCache.addEndpoint("server-a:443", endpointClient)
+	epCache.addEndpoint("server-a:443", endpointClientA)
+	epCache.addEndpoint("server-b:443", endpointClientB)
 	router := newLocationRouter(epCache)
-	router.observeResultSet(&sppb.ResultSet{CacheUpdate: createRangeCacheUpdateForHint(&sppb.RoutingHint{Key: []byte("b")})})
+	update := createRangeCacheUpdateForHint(&sppb.RoutingHint{Key: []byte("b")})
+	update.Group[0].Tablets[0].ServerAddress = "server-a:443"
+	update.Group[0].Tablets = append(update.Group[0].Tablets, &sppb.Tablet{
+		TabletUid:     12,
+		ServerAddress: "server-b:443",
+		Role:          sppb.Tablet_READ_WRITE,
+		Incarnation:   []byte("i2"),
+	})
+	router.observeResultSet(&sppb.ResultSet{CacheUpdate: update})
 	waitForAsyncRoutingUpdate(t, func() bool {
 		req := executeSQLWithKeyAndSelector("b", nil)
 		return router.prepareExecuteSQLRequest(context.Background(), req) != nil
@@ -581,11 +671,14 @@ func TestLocationAwareSpannerClient_ExecuteStreamingSQLRetriesAvoidExcludedEndpo
 	if err != nil {
 		t.Fatalf("unexpected retry stream recv error: %v", err)
 	}
-	if endpointClient.executeStreamSQLCount != 1 {
-		t.Fatalf("expected first attempt to hit routed endpoint once, got %d", endpointClient.executeStreamSQLCount)
+	if endpointClientA.executeStreamSQLCount != 1 {
+		t.Fatalf("expected first attempt to hit routed endpoint once, got %d", endpointClientA.executeStreamSQLCount)
 	}
-	if defaultClient.executeStreamSQLCount != 1 {
-		t.Fatalf("expected retry attempt to fall back to default endpoint once, got %d", defaultClient.executeStreamSQLCount)
+	if endpointClientB.executeStreamSQLCount != 1 {
+		t.Fatalf("expected retry attempt to hit alternate endpoint once, got %d", endpointClientB.executeStreamSQLCount)
+	}
+	if defaultClient.executeStreamSQLCount != 0 {
+		t.Fatalf("expected no default endpoint fallback, got %d", defaultClient.executeStreamSQLCount)
 	}
 }
 

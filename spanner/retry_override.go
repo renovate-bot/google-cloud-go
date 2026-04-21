@@ -25,19 +25,91 @@ import (
 )
 
 type suppressRetryCodesOption struct {
-	codes map[codes.Code]struct{}
+	code1 codes.Code
+	code2 codes.Code
+	len   uint8
+	extra map[codes.Code]struct{}
 }
 
 func newSuppressRetryCodesOption(suppressedCodes ...codes.Code) suppressRetryCodesOption {
-	suppressed := make(map[codes.Code]struct{}, len(suppressedCodes))
+	opt := suppressRetryCodesOption{}
 	for _, code := range suppressedCodes {
-		suppressed[code] = struct{}{}
+		switch opt.len {
+		case 0:
+			opt.code1 = code
+			opt.len = 1
+		case 1:
+			if code != opt.code1 {
+				opt.code2 = code
+				opt.len = 2
+			}
+		default:
+			if code == opt.code1 || code == opt.code2 {
+				continue
+			}
+			if opt.extra == nil {
+				opt.extra = map[codes.Code]struct{}{
+					opt.code1: {},
+					opt.code2: {},
+				}
+			}
+			opt.extra[code] = struct{}{}
+		}
 	}
-	return suppressRetryCodesOption{codes: suppressed}
+	return opt
+}
+
+type resourceExhaustedMarkerOption struct {
+	mark                         func(error)
+	allowRetryWithoutServerDelay bool
+}
+
+func appendResourceExhaustedMarkerOptions(base []gax.CallOption, mark func(error), allowRetryWithoutServerDelay bool) []gax.CallOption {
+	if mark == nil && !allowRetryWithoutServerDelay {
+		return base
+	}
+	opts := append([]gax.CallOption{}, base...)
+	opts = append(opts, resourceExhaustedMarkerOption{
+		mark:                         mark,
+		allowRetryWithoutServerDelay: allowRetryWithoutServerDelay,
+	})
+	return opts
+}
+
+func (opt resourceExhaustedMarkerOption) Resolve(cs *gax.CallSettings) {
+	if cs.Retry == nil {
+		return
+	}
+
+	originalRetryFactory := cs.Retry
+	cs.Retry = func() gax.Retryer {
+		originalRetryer := originalRetryFactory()
+		if originalRetryer == nil {
+			return nil
+		}
+		if opt.allowRetryWithoutServerDelay {
+			if originalSpannerRetryer, ok := originalRetryer.(*spannerRetryer); ok {
+				originalRetryer = &spannerRetryer{
+					Retryer:                                originalSpannerRetryer.Retryer,
+					allowResourceExhaustedWithoutRetryInfo: true,
+				}
+			}
+		}
+		if opt.mark == nil {
+			return originalRetryer
+		}
+
+		return wrapRetryFn(func(err error) (time.Duration, bool) {
+			if shouldCooldownEndpointOnRetry(status.Code(err)) {
+				opt.mark(err)
+			}
+			return originalRetryer.Retry(err)
+		})
+	}
 }
 
 func (opt suppressRetryCodesOption) Resolve(cs *gax.CallSettings) {
-	if len(opt.codes) == 0 || cs.Retry == nil {
+	if opt.len == 0 || cs.Retry == nil {
 		return
 	}
 
@@ -49,10 +121,25 @@ func (opt suppressRetryCodesOption) Resolve(cs *gax.CallSettings) {
 		}
 
 		return wrapRetryFn(func(err error) (time.Duration, bool) {
-			if _, found := opt.codes[status.Code(err)]; found {
+			if opt.contains(status.Code(err)) {
 				return 0, false
 			}
 			return originalRetryer.Retry(err)
 		})
+	}
+}
+
+func (opt suppressRetryCodesOption) contains(code codes.Code) bool {
+	if opt.extra != nil {
+		_, ok := opt.extra[code]
+		return ok
+	}
+	switch opt.len {
+	case 1:
+		return code == opt.code1
+	case 2:
+		return code == opt.code1 || code == opt.code2
+	default:
+		return false
 	}
 }

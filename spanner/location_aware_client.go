@@ -19,42 +19,73 @@ package spanner
 import (
 	"context"
 	"sync"
+	"time"
 
 	vkit "cloud.google.com/go/spanner/apiv1"
 	"cloud.google.com/go/spanner/apiv1/spannerpb"
 	"github.com/googleapis/gax-go/v2"
-	"go.opentelemetry.io/otel/attribute"
-	otrace "go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
-// locationAwareSpannerClient is a spannerClient wrapper that routes RPCs to
-// specific server endpoints based on location-aware routing hints.
-//
-// Routed RPCs (StreamingRead, Read, ExecuteStreamingSql, ExecuteSql,
-// BeginTransaction) first ask the locationRouter for a routing hint and
-// endpoint, then dispatch to the endpoint's spannerClient if available.
-//
-// Affinity RPCs (Commit, Rollback) look up the transaction affinity set by
-// prior RPCs and route to the same server.
-//
-// All other RPCs are passed through to the default client.
+var suppressResourceExhaustedRetryOption = newSuppressRetryCodesOption(codes.ResourceExhausted)
+var suppressEndpointRetryOptions = newSuppressRetryCodesOption(codes.ResourceExhausted, codes.Unavailable)
+
+type locationAwareState struct {
+	clientPool              []spannerClient
+	router                  *locationRouter
+	endpointCache           channelEndpointCache
+	defaultAffinityEndpoint channelEndpoint
+	defaultEndpointAddress  string
+	endpointCooldowns       *endpointOverloadCooldownTracker
+}
+
+func newLocationAwareState(
+	clientPool []spannerClient,
+	router *locationRouter,
+	endpointCache channelEndpointCache,
+	endpointCooldowns *endpointOverloadCooldownTracker,
+) *locationAwareState {
+	var defaultAffinityEndpoint channelEndpoint = &passthroughChannelEndpoint{address: ""}
+	if endpointCache != nil && endpointCache.DefaultChannel() != nil {
+		defaultAffinityEndpoint = endpointCache.DefaultChannel()
+	}
+	if endpointCooldowns == nil {
+		endpointCooldowns = newEndpointOverloadCooldownTracker()
+	}
+	return &locationAwareState{
+		clientPool:              clientPool,
+		router:                  router,
+		endpointCache:           endpointCache,
+		defaultAffinityEndpoint: defaultAffinityEndpoint,
+		defaultEndpointAddress:  defaultAffinityEndpoint.Address(),
+		endpointCooldowns:       endpointCooldowns,
+	}
+}
+
+func (s *locationAwareState) defaultClient(idx int) spannerClient {
+	if s == nil || idx < 0 || idx >= len(s.clientPool) {
+		return nil
+	}
+	return s.clientPool[idx]
+}
+
+// locationAwareSpannerClient is a thin spannerClient adapter that routes RPCs
+// using shared client-level location-aware state while preserving the chosen
+// default pooled client for the current request.
 type locationAwareSpannerClient struct {
+	state                   *locationAwareState
+	defaultClientIndex      int
 	defaultClient           spannerClient
 	router                  *locationRouter
 	endpointCache           channelEndpointCache
 	defaultAffinityEndpoint channelEndpoint
 	defaultEndpointAddress  string
-	excludedEndpoints       *logicalRequestEndpointExclusionCache
+	endpointCooldowns       *endpointOverloadCooldownTracker
 }
 
 var _ spannerClient = (*locationAwareSpannerClient)(nil)
-
-type requestIDAttemptOptioner interface {
-	withNextRetryAttempt(uint32) gax.CallOption
-}
 
 // asGRPCSpannerClient extracts the underlying *grpcSpannerClient from a
 // spannerClient, handling the locationAwareSpannerClient wrapper.
@@ -69,17 +100,26 @@ func asGRPCSpannerClient(c spannerClient) *grpcSpannerClient {
 }
 
 func newLocationAwareSpannerClient(defaultClient spannerClient, router *locationRouter, endpointCache channelEndpointCache) *locationAwareSpannerClient {
-	var defaultAffinityEndpoint channelEndpoint = &passthroughChannelEndpoint{address: ""}
-	if endpointCache != nil && endpointCache.DefaultChannel() != nil {
-		defaultAffinityEndpoint = endpointCache.DefaultChannel()
+	return newIndexedLocationAwareSpannerClient(
+		newLocationAwareState([]spannerClient{defaultClient}, router, endpointCache, nil),
+		0,
+	)
+}
+
+func newIndexedLocationAwareSpannerClient(state *locationAwareState, defaultClientIndex int) *locationAwareSpannerClient {
+	if state == nil {
+		return &locationAwareSpannerClient{defaultClientIndex: defaultClientIndex}
 	}
+	defaultClient := state.defaultClient(defaultClientIndex)
 	return &locationAwareSpannerClient{
+		state:                   state,
+		defaultClientIndex:      defaultClientIndex,
 		defaultClient:           defaultClient,
-		router:                  router,
-		endpointCache:           endpointCache,
-		defaultAffinityEndpoint: defaultAffinityEndpoint,
-		defaultEndpointAddress:  defaultAffinityEndpoint.Address(),
-		excludedEndpoints:       newLogicalRequestEndpointExclusionCache(),
+		router:                  state.router,
+		endpointCache:           state.endpointCache,
+		defaultAffinityEndpoint: state.defaultAffinityEndpoint,
+		defaultEndpointAddress:  state.defaultEndpointAddress,
+		endpointCooldowns:       state.endpointCooldowns,
 	}
 }
 
@@ -97,111 +137,92 @@ func (c *locationAwareSpannerClient) onRequestRouted(ep channelEndpoint) {
 	c.router.lifecycleManager.recordRealTraffic(ep.Address())
 }
 
-func (c *locationAwareSpannerClient) excludedEndpointsForCall(opts []gax.CallOption) (string, endpointExcluder) {
-	if c == nil || c.excludedEndpoints == nil {
-		return "", noExcludedEndpoints
-	}
-	logicalRequestKey := logicalRequestKeyFromCallOptions(opts)
-	return logicalRequestKey, c.excludedEndpoints.consume(logicalRequestKey)
-}
-
-func (c *locationAwareSpannerClient) maybeExcludeEndpointOnNextCall(ep channelEndpoint, logicalRequestKey string, err error) {
-	if c == nil || c.excludedEndpoints == nil || ep == nil || logicalRequestKey == "" {
+func (c *locationAwareSpannerClient) maybeMarkEndpointCoolingDown(ep channelEndpoint, err error) {
+	if c == nil || ep == nil {
 		return
 	}
-	if status.Code(err) != codes.ResourceExhausted {
+	if !shouldCooldownEndpointOnRetry(status.Code(err)) {
 		return
 	}
 	if ep.Address() == c.defaultEndpointAddress {
 		return
 	}
-	c.excludedEndpoints.record(logicalRequestKey, ep.Address())
+	if c.endpointCooldowns != nil {
+		c.endpointCooldowns.recordFailure(ep.Address())
+	}
 }
 
-func (c *locationAwareSpannerClient) recordRouteSelectionTrace(ctx context.Context, method string, ep channelEndpoint, usedDefaultEndpoint bool, details routeSelectionDetails) {
-	endpointAddr := details.selectedEndpoint
-	if endpointAddr == "" && ep != nil {
-		endpointAddr = ep.Address()
-	}
+func shouldCooldownEndpointOnRetry(code codes.Code) bool {
+	return code == codes.ResourceExhausted || code == codes.Unavailable
+}
 
-	if c == nil {
+func (c *locationAwareSpannerClient) maybeRecordEndpointErrorPenalty(ep channelEndpoint, operationUID uint64, preferLeader bool, err error) {
+	if c == nil || ep == nil || operationUID == 0 {
 		return
 	}
-
-	span := otrace.SpanFromContext(ctx)
-	if !span.IsRecording() {
+	if !shouldCooldownEndpointOnRetry(status.Code(err)) || ep.Address() == c.defaultEndpointAddress {
 		return
 	}
-
-	target := c.defaultEndpointAddress
-	if !usedDefaultEndpoint && ep != nil {
-		target = ep.Address()
-	}
-
-	attrs := []attribute.KeyValue{
-		attribute.String("spanner.target", target),
-		attribute.Bool("spanner.route.used_default_endpoint", usedDefaultEndpoint),
-		attribute.Bool("spanner.route.has_channel_finder", endpointAddr != ""),
-		attribute.String("spanner.route.method", method),
-	}
-	if details.defaultReasonCode != "" {
-		attrs = append(attrs, attribute.String("spanner.route.default_reason_code", details.defaultReasonCode))
-	}
-	span.SetAttributes(attrs...)
-	span.AddEvent("spanner.route.selected", otrace.WithAttributes(attrs...))
+	endpointLatencyRegistryRecordError(operationUID, preferLeader, ep.Address())
 }
 
-func requestIDAttemptOptionerFromCallOptions(client spannerClient, opts []gax.CallOption) requestIDAttemptOptioner {
-	if len(opts) != 0 {
-		var settings gax.CallSettings
-		for _, opt := range opts {
-			if opt == nil {
-				continue
-			}
-			opt.Resolve(&settings)
-		}
-		_, reqID, found := gRPCCallOptionsToRequestID(settings.GRPC)
-		if found {
-			return logicalRequestIDWrap{logicalKey: reqID.logicalRequestKey()}
-		}
+func (c *locationAwareSpannerClient) recordEndpointLatency(ep channelEndpoint, operationUID uint64, preferLeader bool, startedAt time.Time) {
+	if c == nil || ep == nil || operationUID == 0 || ep.Address() == c.defaultEndpointAddress {
+		return
 	}
-
-	gsc := asGRPCSpannerClient(client)
-	if gsc == nil {
-		return nil
-	}
-	return gsc.generateRequestIDHeaderInjector()
+	endpointLatencyRegistryRecordLatency(operationUID, preferLeader, ep.Address(), time.Since(startedAt))
 }
 
-func appendUnaryRetryOverrideOptions(base []gax.CallOption, requestID requestIDAttemptOptioner, attempt uint32) []gax.CallOption {
-	opts := append([]gax.CallOption{}, base...)
-	if requestID != nil {
-		opts = append(opts, requestID.withNextRetryAttempt(attempt))
+func (c *locationAwareSpannerClient) rerouteErrorMarker(ep channelEndpoint, operationUID uint64, preferLeader bool) func(error) {
+	var once sync.Once
+	return func(err error) {
+		if !shouldCooldownEndpointOnRetry(status.Code(err)) {
+			return
+		}
+		once.Do(func() {
+			c.maybeMarkEndpointCoolingDown(ep, err)
+			c.maybeRecordEndpointErrorPenalty(ep, operationUID, preferLeader, err)
+		})
 	}
-	opts = append(opts, newSuppressRetryCodesOption(codes.ResourceExhausted))
+}
+
+func (c *locationAwareSpannerClient) reroutedCallOptions(base []gax.CallOption, logicalRequestKey string, attempt uint32, mark func(error), suppressUnavailable bool) []gax.CallOption {
+	extraOptions := 2
+	if logicalRequestKey != "" && attempt > 1 {
+		extraOptions++
+	}
+	opts := make([]gax.CallOption, 0, len(base)+extraOptions)
+	opts = append(opts, base...)
+	if logicalRequestKey != "" && attempt > 1 {
+		opts = append(opts, logicalRequestIDWrap{logicalKey: logicalRequestKey}.withNextRetryAttempt(attempt))
+	}
+	opts = append(opts, resourceExhaustedMarkerOption{mark: mark})
+	if suppressUnavailable {
+		opts = append(opts, suppressEndpointRetryOptions)
+	} else {
+		opts = append(opts, suppressResourceExhaustedRetryOption)
+	}
 	return opts
 }
 
-func combineEndpointExcluders(base endpointExcluder, excludedAddress string) endpointExcluder {
-	if excludedAddress == "" {
-		return base
+func (c *locationAwareSpannerClient) maybeWaitForReroute(ctx context.Context, ep channelEndpoint, lastRoutedAddress string) (bool, error) {
+	if c == nil || lastRoutedAddress == "" {
+		return false, nil
 	}
-	return func(address string) bool {
-		if address == excludedAddress {
-			return true
-		}
-		return isEndpointExcluded(base, address)
+	if c.endpointCooldowns == nil {
+		return false, nil
 	}
-}
-
-func (c *locationAwareSpannerClient) shouldManualRoutedUnaryRetry(ep channelEndpoint, client spannerClient, err error) bool {
-	if c == nil || ep == nil || client == nil || client == c.defaultClient {
-		return false
+	if ep != nil && (ep.Address() == "" || ep.Address() != lastRoutedAddress) {
+		return false, nil
 	}
-	if ep.Address() == "" || ep.Address() == c.defaultEndpointAddress {
-		return false
+	wait := c.endpointCooldowns.remainingCooldown(lastRoutedAddress)
+	if wait <= 0 {
+		return false, nil
 	}
-	return status.Code(err) == codes.ResourceExhausted
+	if err := gax.Sleep(ctx, wait); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 func (c *locationAwareSpannerClient) observeExecuteSQLResponse(req *spannerpb.ExecuteSqlRequest, resp *spannerpb.ResultSet, ep channelEndpoint) {
@@ -255,15 +276,15 @@ func (c *locationAwareSpannerClient) clientForEndpoint(ep channelEndpoint) spann
 // affinityClient returns the spannerClient for a given transaction ID based on
 // affinity, falling back to the default client.
 func (c *locationAwareSpannerClient) affinityClient(txID []byte) spannerClient {
-	return c.affinityClientWithExclusions(txID, nil)
+	return c.affinityClientWithCooldownTracker(txID, nil)
 }
 
-func (c *locationAwareSpannerClient) affinityEndpoint(txID []byte, excludedEndpoints endpointExcluder) channelEndpoint {
+func (c *locationAwareSpannerClient) affinityEndpoint(txID []byte, cooldowns *endpointOverloadCooldownTracker) channelEndpoint {
 	if len(txID) == 0 {
 		return nil
 	}
 	ep := c.router.getTransactionAffinity(string(txID))
-	if ep != nil && isEndpointExcluded(excludedEndpoints, ep.Address()) {
+	if ep != nil && isEndpointCoolingDown(cooldowns, ep.Address()) {
 		return nil
 	}
 	if ep != nil && !ep.IsHealthy() && c.router != nil && c.router.lifecycleManager != nil {
@@ -275,8 +296,8 @@ func (c *locationAwareSpannerClient) affinityEndpoint(txID []byte, excludedEndpo
 	return ep
 }
 
-func (c *locationAwareSpannerClient) affinityClientWithExclusions(txID []byte, excludedEndpoints endpointExcluder) spannerClient {
-	ep := c.affinityEndpoint(txID, excludedEndpoints)
+func (c *locationAwareSpannerClient) affinityClientWithCooldownTracker(txID []byte, cooldowns *endpointOverloadCooldownTracker) spannerClient {
+	ep := c.affinityEndpoint(txID, cooldowns)
 	return c.clientForEndpoint(ep)
 }
 
@@ -333,173 +354,246 @@ func (c *locationAwareSpannerClient) BatchWrite(ctx context.Context, req *spanne
 // --- Routed RPCs ---
 
 func (c *locationAwareSpannerClient) StreamingRead(ctx context.Context, req *spannerpb.ReadRequest, opts ...gax.CallOption) (spannerpb.Spanner_StreamingReadClient, error) {
-	logicalRequestKey, excludedEndpoints := c.excludedEndpointsForCall(opts)
-	ep, details := c.router.prepareReadRequestWithExclusionsAndDetails(ctx, req, excludedEndpoints)
-	client := c.clientForEndpoint(ep)
-	c.recordRouteSelectionTrace(ctx, "google.spanner.v1.Spanner/StreamingRead", ep, client == c.defaultClient, details)
-	stream, err := client.StreamingRead(ctx, req, opts...)
-	if err != nil {
-		c.maybeExcludeEndpointOnNextCall(ep, logicalRequestKey, err)
-		return nil, err
+	logicalRequestKey := logicalRequestKeyFromCallOptions(opts)
+	cooldowns := c.endpointCooldowns
+	preferLeader := preferLeaderFromSelector(req.GetTransaction())
+	lastRoutedAddress := ""
+	for attempt := uint32(1); ; attempt++ {
+		ep := c.router.prepareReadRequestWithCooldownTracker(ctx, req, cooldowns)
+		operationUID := req.GetRoutingHint().GetOperationUid()
+		if waited, err := c.maybeWaitForReroute(ctx, ep, lastRoutedAddress); err != nil {
+			return nil, err
+		} else if waited {
+			continue
+		}
+		client := c.clientForEndpoint(ep)
+		usedDefaultEndpoint := client == c.defaultClient
+		markRetryableError := c.rerouteErrorMarker(ep, operationUID, preferLeader)
+		currentOpts := c.reroutedCallOptions(opts, logicalRequestKey, attempt, markRetryableError, !usedDefaultEndpoint)
+		if ep != nil {
+			ep.IncrementActiveRequests()
+		}
+		startedAt := time.Now()
+		stream, err := client.StreamingRead(ctx, req, currentOpts...)
+		if err == nil {
+			isReadOnlyBegin, readOnlyStrong := readOnlyBeginFromSelector(req.GetTransaction())
+			return newAffinityTrackingStream(
+				stream,
+				c.router,
+				c.affinityTrackingEndpoint(ep),
+				isReadOnlyBegin,
+				readOnlyStrong,
+				isReadWriteBeginFromSelector(req.GetTransaction()),
+				func() { c.recordEndpointLatency(ep, operationUID, preferLeader, startedAt) },
+				markRetryableError,
+				func() {
+					if ep != nil {
+						ep.DecrementActiveRequests()
+					}
+				},
+			), nil
+		}
+		if ep != nil {
+			ep.DecrementActiveRequests()
+		}
+		markRetryableError(err)
+		if !shouldCooldownEndpointOnRetry(status.Code(err)) || ep == nil || usedDefaultEndpoint {
+			return nil, err
+		}
+		lastRoutedAddress = ep.Address()
 	}
-	isReadOnlyBegin, readOnlyStrong := readOnlyBeginFromSelector(req.GetTransaction())
-	return newAffinityTrackingStream(
-		stream,
-		c.router,
-		c.affinityTrackingEndpoint(ep),
-		isReadOnlyBegin,
-		readOnlyStrong,
-		isReadWriteBeginFromSelector(req.GetTransaction()),
-		nil,
-		func(err error) {
-			c.maybeExcludeEndpointOnNextCall(ep, logicalRequestKey, err)
-		},
-	), nil
 }
 
 func (c *locationAwareSpannerClient) Read(ctx context.Context, req *spannerpb.ReadRequest, opts ...gax.CallOption) (*spannerpb.ResultSet, error) {
-	logicalRequestKey, excludedEndpoints := c.excludedEndpointsForCall(opts)
-	requestID := requestIDAttemptOptionerFromCallOptions(c.defaultClient, opts)
-	ep, details := c.router.prepareReadRequestWithExclusionsAndDetails(ctx, req, excludedEndpoints)
-	client := c.clientForEndpoint(ep)
-	c.recordRouteSelectionTrace(ctx, "google.spanner.v1.Spanner/Read", ep, client == c.defaultClient, details)
-	resp, err := client.Read(ctx, req, appendUnaryRetryOverrideOptions(opts, requestID, 1)...)
-	if err != nil {
-		if !c.shouldManualRoutedUnaryRetry(ep, client, err) {
-			c.maybeExcludeEndpointOnNextCall(ep, logicalRequestKey, err)
+	logicalRequestKey := logicalRequestKeyFromCallOptions(opts)
+	cooldowns := c.endpointCooldowns
+	preferLeader := preferLeaderFromSelector(req.GetTransaction())
+	lastRoutedAddress := ""
+	for attempt := uint32(1); ; attempt++ {
+		ep := c.router.prepareReadRequestWithCooldownTracker(ctx, req, cooldowns)
+		operationUID := req.GetRoutingHint().GetOperationUid()
+		if waited, err := c.maybeWaitForReroute(ctx, ep, lastRoutedAddress); err != nil {
 			return nil, err
+		} else if waited {
+			continue
 		}
-
-		retryExcludedEndpoints := combineEndpointExcluders(excludedEndpoints, ep.Address())
-		retryEndpoint, retryDetails := c.router.prepareReadRequestWithExclusionsAndDetails(ctx, req, retryExcludedEndpoints)
-		retryClient := c.clientForEndpoint(retryEndpoint)
-		c.recordRouteSelectionTrace(ctx, "google.spanner.v1.Spanner/Read", retryEndpoint, retryClient == c.defaultClient, retryDetails)
-		resp, err = retryClient.Read(ctx, req, appendUnaryRetryOverrideOptions(opts, requestID, 2)...)
+		client := c.clientForEndpoint(ep)
+		usedDefaultEndpoint := client == c.defaultClient
+		markRetryableError := c.rerouteErrorMarker(ep, operationUID, preferLeader)
+		currentOpts := c.reroutedCallOptions(opts, logicalRequestKey, attempt, markRetryableError, !usedDefaultEndpoint)
+		if ep != nil {
+			ep.IncrementActiveRequests()
+		}
+		startedAt := time.Now()
+		resp, err := client.Read(ctx, req, currentOpts...)
+		if ep != nil {
+			ep.DecrementActiveRequests()
+		}
 		if err == nil {
-			c.observeReadResponse(req, resp, retryEndpoint)
+			c.recordEndpointLatency(ep, operationUID, preferLeader, startedAt)
+			c.observeReadResponse(req, resp, ep)
 			return resp, nil
 		}
-		c.maybeExcludeEndpointOnNextCall(retryEndpoint, logicalRequestKey, err)
-		return nil, err
+		markRetryableError(err)
+		if !shouldCooldownEndpointOnRetry(status.Code(err)) || ep == nil || usedDefaultEndpoint {
+			return nil, err
+		}
+		lastRoutedAddress = ep.Address()
 	}
-	c.observeReadResponse(req, resp, ep)
-	return resp, nil
 }
 
 func (c *locationAwareSpannerClient) ExecuteStreamingSql(ctx context.Context, req *spannerpb.ExecuteSqlRequest, opts ...gax.CallOption) (spannerpb.Spanner_ExecuteStreamingSqlClient, error) {
-	logicalRequestKey, excludedEndpoints := c.excludedEndpointsForCall(opts)
-	ep, details := c.router.prepareExecuteSQLRequestWithExclusionsAndDetails(ctx, req, excludedEndpoints)
-	client := c.clientForEndpoint(ep)
-	c.recordRouteSelectionTrace(ctx, "google.spanner.v1.Spanner/ExecuteStreamingSql", ep, client == c.defaultClient, details)
-	stream, err := client.ExecuteStreamingSql(ctx, req, opts...)
-	if err != nil {
-		c.maybeExcludeEndpointOnNextCall(ep, logicalRequestKey, err)
-		return nil, err
+	logicalRequestKey := logicalRequestKeyFromCallOptions(opts)
+	cooldowns := c.endpointCooldowns
+	preferLeader := preferLeaderFromSelector(req.GetTransaction())
+	lastRoutedAddress := ""
+	for attempt := uint32(1); ; attempt++ {
+		ep := c.router.prepareExecuteSQLRequestWithCooldownTracker(ctx, req, cooldowns)
+		operationUID := req.GetRoutingHint().GetOperationUid()
+		if waited, err := c.maybeWaitForReroute(ctx, ep, lastRoutedAddress); err != nil {
+			return nil, err
+		} else if waited {
+			continue
+		}
+		client := c.clientForEndpoint(ep)
+		usedDefaultEndpoint := client == c.defaultClient
+		markRetryableError := c.rerouteErrorMarker(ep, operationUID, preferLeader)
+		currentOpts := c.reroutedCallOptions(opts, logicalRequestKey, attempt, markRetryableError, !usedDefaultEndpoint)
+		if ep != nil {
+			ep.IncrementActiveRequests()
+		}
+		startedAt := time.Now()
+		stream, err := client.ExecuteStreamingSql(ctx, req, currentOpts...)
+		if err == nil {
+			isReadOnlyBegin, readOnlyStrong := readOnlyBeginFromSelector(req.GetTransaction())
+			return newAffinityTrackingStream(
+				stream,
+				c.router,
+				c.affinityTrackingEndpoint(ep),
+				isReadOnlyBegin,
+				readOnlyStrong,
+				isReadWriteBeginFromSelector(req.GetTransaction()),
+				func() { c.recordEndpointLatency(ep, operationUID, preferLeader, startedAt) },
+				markRetryableError,
+				func() {
+					if ep != nil {
+						ep.DecrementActiveRequests()
+					}
+				},
+			), nil
+		}
+		if ep != nil {
+			ep.DecrementActiveRequests()
+		}
+		markRetryableError(err)
+		if !shouldCooldownEndpointOnRetry(status.Code(err)) || ep == nil || usedDefaultEndpoint {
+			return nil, err
+		}
+		lastRoutedAddress = ep.Address()
 	}
-	isReadOnlyBegin, readOnlyStrong := readOnlyBeginFromSelector(req.GetTransaction())
-	return newAffinityTrackingStream(
-		stream,
-		c.router,
-		c.affinityTrackingEndpoint(ep),
-		isReadOnlyBegin,
-		readOnlyStrong,
-		isReadWriteBeginFromSelector(req.GetTransaction()),
-		nil,
-		func(err error) {
-			c.maybeExcludeEndpointOnNextCall(ep, logicalRequestKey, err)
-		},
-	), nil
 }
 
 func (c *locationAwareSpannerClient) ExecuteSql(ctx context.Context, req *spannerpb.ExecuteSqlRequest, opts ...gax.CallOption) (*spannerpb.ResultSet, error) {
-	logicalRequestKey, excludedEndpoints := c.excludedEndpointsForCall(opts)
-	requestID := requestIDAttemptOptionerFromCallOptions(c.defaultClient, opts)
-	ep, details := c.router.prepareExecuteSQLRequestWithExclusionsAndDetails(ctx, req, excludedEndpoints)
-	client := c.clientForEndpoint(ep)
-	c.recordRouteSelectionTrace(ctx, "google.spanner.v1.Spanner/ExecuteSql", ep, client == c.defaultClient, details)
-	resp, err := client.ExecuteSql(ctx, req, appendUnaryRetryOverrideOptions(opts, requestID, 1)...)
-	if err != nil {
-		if !c.shouldManualRoutedUnaryRetry(ep, client, err) {
-			c.maybeExcludeEndpointOnNextCall(ep, logicalRequestKey, err)
+	logicalRequestKey := logicalRequestKeyFromCallOptions(opts)
+	cooldowns := c.endpointCooldowns
+	preferLeader := preferLeaderFromSelector(req.GetTransaction())
+	lastRoutedAddress := ""
+	for attempt := uint32(1); ; attempt++ {
+		ep := c.router.prepareExecuteSQLRequestWithCooldownTracker(ctx, req, cooldowns)
+		operationUID := req.GetRoutingHint().GetOperationUid()
+		if waited, err := c.maybeWaitForReroute(ctx, ep, lastRoutedAddress); err != nil {
 			return nil, err
+		} else if waited {
+			continue
 		}
-
-		retryExcludedEndpoints := combineEndpointExcluders(excludedEndpoints, ep.Address())
-		retryEndpoint, retryDetails := c.router.prepareExecuteSQLRequestWithExclusionsAndDetails(ctx, req, retryExcludedEndpoints)
-		retryClient := c.clientForEndpoint(retryEndpoint)
-		c.recordRouteSelectionTrace(ctx, "google.spanner.v1.Spanner/ExecuteSql", retryEndpoint, retryClient == c.defaultClient, retryDetails)
-		resp, err = retryClient.ExecuteSql(ctx, req, appendUnaryRetryOverrideOptions(opts, requestID, 2)...)
+		client := c.clientForEndpoint(ep)
+		usedDefaultEndpoint := client == c.defaultClient
+		markRetryableError := c.rerouteErrorMarker(ep, operationUID, preferLeader)
+		currentOpts := c.reroutedCallOptions(opts, logicalRequestKey, attempt, markRetryableError, !usedDefaultEndpoint)
+		if ep != nil {
+			ep.IncrementActiveRequests()
+		}
+		startedAt := time.Now()
+		resp, err := client.ExecuteSql(ctx, req, currentOpts...)
+		if ep != nil {
+			ep.DecrementActiveRequests()
+		}
 		if err == nil {
-			c.observeExecuteSQLResponse(req, resp, retryEndpoint)
+			c.recordEndpointLatency(ep, operationUID, preferLeader, startedAt)
+			c.observeExecuteSQLResponse(req, resp, ep)
 			return resp, nil
 		}
-		c.maybeExcludeEndpointOnNextCall(retryEndpoint, logicalRequestKey, err)
-		return nil, err
+		markRetryableError(err)
+		if !shouldCooldownEndpointOnRetry(status.Code(err)) || ep == nil || usedDefaultEndpoint {
+			return nil, err
+		}
+		lastRoutedAddress = ep.Address()
 	}
-	c.observeExecuteSQLResponse(req, resp, ep)
-	return resp, nil
 }
 
 func (c *locationAwareSpannerClient) BeginTransaction(ctx context.Context, req *spannerpb.BeginTransactionRequest, opts ...gax.CallOption) (*spannerpb.Transaction, error) {
-	logicalRequestKey, excludedEndpoints := c.excludedEndpointsForCall(opts)
-	requestID := requestIDAttemptOptionerFromCallOptions(c.defaultClient, opts)
-	ep, details := c.router.prepareBeginTransactionRequestWithExclusionsAndDetails(ctx, req, excludedEndpoints)
-	client := c.clientForEndpoint(ep)
-	c.recordRouteSelectionTrace(ctx, "google.spanner.v1.Spanner/BeginTransaction", ep, client == c.defaultClient, details)
-	resp, err := client.BeginTransaction(ctx, req, appendUnaryRetryOverrideOptions(opts, requestID, 1)...)
-	if err != nil {
-		if !c.shouldManualRoutedUnaryRetry(ep, client, err) {
-			c.maybeExcludeEndpointOnNextCall(ep, logicalRequestKey, err)
+	logicalRequestKey := logicalRequestKeyFromCallOptions(opts)
+	cooldowns := c.endpointCooldowns
+	preferLeader := preferLeaderFromTransactionOptions(req.GetOptions())
+	operationUID := req.GetRoutingHint().GetOperationUid()
+	lastRoutedAddress := ""
+	for attempt := uint32(1); ; attempt++ {
+		ep := c.router.prepareBeginTransactionRequestWithCooldownTracker(ctx, req, cooldowns)
+		if waited, err := c.maybeWaitForReroute(ctx, ep, lastRoutedAddress); err != nil {
 			return nil, err
+		} else if waited {
+			continue
 		}
-
-		retryExcludedEndpoints := combineEndpointExcluders(excludedEndpoints, ep.Address())
-		retryEndpoint, retryDetails := c.router.prepareBeginTransactionRequestWithExclusionsAndDetails(ctx, req, retryExcludedEndpoints)
-		retryClient := c.clientForEndpoint(retryEndpoint)
-		c.recordRouteSelectionTrace(ctx, "google.spanner.v1.Spanner/BeginTransaction", retryEndpoint, retryClient == c.defaultClient, retryDetails)
-		resp, err = retryClient.BeginTransaction(ctx, req, appendUnaryRetryOverrideOptions(opts, requestID, 2)...)
+		client := c.clientForEndpoint(ep)
+		usedDefaultEndpoint := client == c.defaultClient
+		markRetryableError := c.rerouteErrorMarker(ep, operationUID, preferLeader)
+		currentOpts := c.reroutedCallOptions(opts, logicalRequestKey, attempt, markRetryableError, !usedDefaultEndpoint)
+		if ep != nil {
+			ep.IncrementActiveRequests()
+		}
+		startedAt := time.Now()
+		resp, err := client.BeginTransaction(ctx, req, currentOpts...)
+		if ep != nil {
+			ep.DecrementActiveRequests()
+		}
 		if err == nil {
-			c.observeBeginTransactionResponse(req, resp, retryEndpoint)
+			c.recordEndpointLatency(ep, operationUID, preferLeader, startedAt)
+			c.observeBeginTransactionResponse(req, resp, ep)
 			return resp, nil
 		}
-		c.maybeExcludeEndpointOnNextCall(retryEndpoint, logicalRequestKey, err)
-		return nil, err
+		markRetryableError(err)
+		if !shouldCooldownEndpointOnRetry(status.Code(err)) || ep == nil || usedDefaultEndpoint {
+			return nil, err
+		}
+		lastRoutedAddress = ep.Address()
 	}
-	c.observeBeginTransactionResponse(req, resp, ep)
-	return resp, nil
 }
 
 // --- Affinity RPCs ---
 
 func (c *locationAwareSpannerClient) Commit(ctx context.Context, req *spannerpb.CommitRequest, opts ...gax.CallOption) (*spannerpb.CommitResponse, error) {
-	logicalRequestKey, excludedEndpoints := c.excludedEndpointsForCall(opts)
-	ep, details := c.router.prepareCommitRequestWithExclusionsAndDetails(ctx, req, excludedEndpoints)
+	cooldowns := c.endpointCooldowns
+	ep := c.router.prepareCommitRequestWithCooldownTracker(ctx, req, cooldowns)
 	if txID := req.GetTransactionId(); len(txID) > 0 {
-		if affinityEndpoint := c.affinityEndpoint(txID, excludedEndpoints); affinityEndpoint != nil {
+		if affinityEndpoint := c.affinityEndpoint(txID, cooldowns); affinityEndpoint != nil {
 			ep = affinityEndpoint
-			details.setSelectedTablet(ep.Address(), false, false)
 		}
 	}
+	markRetryableError := c.rerouteErrorMarker(ep, 0, false)
 	client := c.clientForEndpoint(ep)
-	c.recordRouteSelectionTrace(ctx, "google.spanner.v1.Spanner/Commit", ep, client == c.defaultClient, details)
-	resp, err := client.Commit(ctx, req, opts...)
-	c.maybeExcludeEndpointOnNextCall(ep, logicalRequestKey, err)
+	resp, err := client.Commit(ctx, req, appendResourceExhaustedMarkerOptions(opts, markRetryableError, true)...)
+	markRetryableError(err)
 	c.router.observeCommitResponse(resp)
 	c.router.clearTransactionAffinity(string(req.GetTransactionId()))
 	return resp, err
 }
 
 func (c *locationAwareSpannerClient) Rollback(ctx context.Context, req *spannerpb.RollbackRequest, opts ...gax.CallOption) error {
-	logicalRequestKey, excludedEndpoints := c.excludedEndpointsForCall(opts)
-	ep := c.affinityEndpoint(req.GetTransactionId(), excludedEndpoints)
-	details := newRouteSelectionDetails()
-	if ep != nil {
-		details.setSelectedTablet(ep.Address(), false, false)
-	}
+	ep := c.affinityEndpoint(req.GetTransactionId(), c.endpointCooldowns)
+	markRetryableError := c.rerouteErrorMarker(ep, 0, false)
 	client := c.clientForEndpoint(ep)
-	c.recordRouteSelectionTrace(ctx, "google.spanner.v1.Spanner/Rollback", ep, client == c.defaultClient, details)
-	err := client.Rollback(ctx, req, opts...)
-	c.maybeExcludeEndpointOnNextCall(ep, logicalRequestKey, err)
+	err := client.Rollback(ctx, req, appendResourceExhaustedMarkerOptions(opts, markRetryableError, true)...)
+	markRetryableError(err)
 	c.router.clearTransactionAffinity(string(req.GetTransactionId()))
 	return err
 }
@@ -517,9 +611,19 @@ type affinityTrackingStream struct {
 	once               sync.Once
 	errorOnce          sync.Once
 	latencyOnce        sync.Once
+	doneOnce           sync.Once
 	inner              streamingClient
 	onFirstResponse    func()
 	onError            func(error)
+	onDone             func()
+}
+
+func (s *affinityTrackingStream) finish() {
+	s.doneOnce.Do(func() {
+		if s.onDone != nil {
+			s.onDone()
+		}
+	})
 }
 
 // streamingClient is the shared interface implemented by both
@@ -538,6 +642,7 @@ func newAffinityTrackingStream(
 	trackAffinity bool,
 	onFirstResponse func(),
 	onError func(error),
+	onDone func(),
 ) *affinityTrackingStream {
 	return &affinityTrackingStream{
 		ClientStream:       inner,
@@ -549,12 +654,14 @@ func newAffinityTrackingStream(
 		inner:              inner,
 		onFirstResponse:    onFirstResponse,
 		onError:            onError,
+		onDone:             onDone,
 	}
 }
 
 func (s *affinityTrackingStream) Recv() (*spannerpb.PartialResultSet, error) {
 	prs, err := s.inner.Recv()
 	if err != nil {
+		s.finish()
 		s.errorOnce.Do(func() {
 			if s.onError != nil {
 				s.onError(err)

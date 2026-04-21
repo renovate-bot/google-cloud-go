@@ -63,93 +63,63 @@ func newLocationRouter(endpointCache channelEndpointCache) *locationRouter {
 }
 
 func (r *locationRouter) prepareReadRequest(ctx context.Context, req *sppb.ReadRequest) channelEndpoint {
-	return r.prepareReadRequestWithExclusions(ctx, req, nil)
+	return r.prepareReadRequestWithCooldownTracker(ctx, req, nil)
 }
 
-func (r *locationRouter) prepareReadRequestWithExclusions(ctx context.Context, req *sppb.ReadRequest, excludedEndpoints endpointExcluder) channelEndpoint {
-	endpoint, _ := r.prepareReadRequestWithExclusionsAndDetails(ctx, req, excludedEndpoints)
-	return endpoint
-}
-
-func (r *locationRouter) prepareReadRequestWithExclusionsAndDetails(ctx context.Context, req *sppb.ReadRequest, excludedEndpoints endpointExcluder) (channelEndpoint, routeSelectionDetails) {
-	details := newRouteSelectionDetails()
+func (r *locationRouter) prepareReadRequestWithCooldownTracker(ctx context.Context, req *sppb.ReadRequest, cooldowns *endpointOverloadCooldownTracker) channelEndpoint {
 	if r == nil || req == nil {
-		details.defaultReasonCode = routeReasonRangeCacheMiss
-		return nil, details
+		return nil
 	}
 	if txID := transactionIDFromSelector(req.GetTransaction()); txID != "" {
 		if preferLeader, ok := r.getReadOnlyTransactionPreferLeader(txID); ok {
-			return r.finder.findServerReadWithExclusionsAndDetails(ctx, req, preferLeader, excludedEndpoints)
+			return r.finder.findServerReadWithCooldownTracker(ctx, req, preferLeader, cooldowns)
 		}
-		if ep := r.getTransactionAffinity(txID); ep != nil && !isEndpointExcluded(excludedEndpoints, ep.Address()) {
-			details.setSelectedTablet(ep.Address(), false, false)
-			return ep, details
+		if ep := r.getTransactionAffinity(txID); ep != nil && !isEndpointCoolingDown(cooldowns, ep.Address()) {
+			return ep
 		}
 	}
-	return r.finder.findServerReadWithExclusionsAndDetails(ctx, req, preferLeaderFromSelector(req.GetTransaction()), excludedEndpoints)
+	return r.finder.findServerReadWithCooldownTracker(ctx, req, preferLeaderFromSelector(req.GetTransaction()), cooldowns)
 }
 
 func (r *locationRouter) prepareExecuteSQLRequest(ctx context.Context, req *sppb.ExecuteSqlRequest) channelEndpoint {
-	return r.prepareExecuteSQLRequestWithExclusions(ctx, req, nil)
+	return r.prepareExecuteSQLRequestWithCooldownTracker(ctx, req, nil)
 }
 
-func (r *locationRouter) prepareExecuteSQLRequestWithExclusions(ctx context.Context, req *sppb.ExecuteSqlRequest, excludedEndpoints endpointExcluder) channelEndpoint {
-	endpoint, _ := r.prepareExecuteSQLRequestWithExclusionsAndDetails(ctx, req, excludedEndpoints)
-	return endpoint
-}
-
-func (r *locationRouter) prepareExecuteSQLRequestWithExclusionsAndDetails(ctx context.Context, req *sppb.ExecuteSqlRequest, excludedEndpoints endpointExcluder) (channelEndpoint, routeSelectionDetails) {
-	details := newRouteSelectionDetails()
+func (r *locationRouter) prepareExecuteSQLRequestWithCooldownTracker(ctx context.Context, req *sppb.ExecuteSqlRequest, cooldowns *endpointOverloadCooldownTracker) channelEndpoint {
 	if r == nil || req == nil {
-		details.defaultReasonCode = routeReasonRangeCacheMiss
-		return nil, details
+		return nil
 	}
 	if txID := transactionIDFromSelector(req.GetTransaction()); txID != "" {
 		if preferLeader, ok := r.getReadOnlyTransactionPreferLeader(txID); ok {
-			return r.finder.findServerExecuteSQLWithExclusionsAndDetails(ctx, req, preferLeader, excludedEndpoints)
+			return r.finder.findServerExecuteSQLWithCooldownTracker(ctx, req, preferLeader, cooldowns)
 		}
-		if ep := r.getTransactionAffinity(txID); ep != nil && !isEndpointExcluded(excludedEndpoints, ep.Address()) {
-			details.setSelectedTablet(ep.Address(), false, false)
-			return ep, details
+		if ep := r.getTransactionAffinity(txID); ep != nil && !isEndpointCoolingDown(cooldowns, ep.Address()) {
+			return ep
 		}
 	}
-	return r.finder.findServerExecuteSQLWithExclusionsAndDetails(ctx, req, preferLeaderFromSelector(req.GetTransaction()), excludedEndpoints)
+	return r.finder.findServerExecuteSQLWithCooldownTracker(ctx, req, preferLeaderFromSelector(req.GetTransaction()), cooldowns)
 }
 
 func (r *locationRouter) prepareBeginTransactionRequest(ctx context.Context, req *sppb.BeginTransactionRequest) channelEndpoint {
-	return r.prepareBeginTransactionRequestWithExclusions(ctx, req, nil)
+	return r.prepareBeginTransactionRequestWithCooldownTracker(ctx, req, nil)
 }
 
-func (r *locationRouter) prepareBeginTransactionRequestWithExclusions(ctx context.Context, req *sppb.BeginTransactionRequest, excludedEndpoints endpointExcluder) channelEndpoint {
-	endpoint, _ := r.prepareBeginTransactionRequestWithExclusionsAndDetails(ctx, req, excludedEndpoints)
-	return endpoint
-}
-
-func (r *locationRouter) prepareBeginTransactionRequestWithExclusionsAndDetails(ctx context.Context, req *sppb.BeginTransactionRequest, excludedEndpoints endpointExcluder) (channelEndpoint, routeSelectionDetails) {
-	details := newRouteSelectionDetails()
+func (r *locationRouter) prepareBeginTransactionRequestWithCooldownTracker(ctx context.Context, req *sppb.BeginTransactionRequest, cooldowns *endpointOverloadCooldownTracker) channelEndpoint {
 	if r == nil || req == nil {
-		details.defaultReasonCode = routeReasonRangeCacheMiss
-		return nil, details
+		return nil
 	}
-	return r.finder.findServerBeginTransactionWithExclusionsAndDetails(ctx, req, excludedEndpoints)
+	return r.finder.findServerBeginTransactionWithCooldownTracker(ctx, req, cooldowns)
 }
 
 func (r *locationRouter) prepareCommitRequest(ctx context.Context, req *sppb.CommitRequest) channelEndpoint {
-	return r.prepareCommitRequestWithExclusions(ctx, req, nil)
+	return r.prepareCommitRequestWithCooldownTracker(ctx, req, nil)
 }
 
-func (r *locationRouter) prepareCommitRequestWithExclusions(ctx context.Context, req *sppb.CommitRequest, excludedEndpoints endpointExcluder) channelEndpoint {
-	endpoint, _ := r.prepareCommitRequestWithExclusionsAndDetails(ctx, req, excludedEndpoints)
-	return endpoint
-}
-
-func (r *locationRouter) prepareCommitRequestWithExclusionsAndDetails(ctx context.Context, req *sppb.CommitRequest, excludedEndpoints endpointExcluder) (channelEndpoint, routeSelectionDetails) {
-	details := newRouteSelectionDetails()
+func (r *locationRouter) prepareCommitRequestWithCooldownTracker(ctx context.Context, req *sppb.CommitRequest, cooldowns *endpointOverloadCooldownTracker) channelEndpoint {
 	if r == nil || req == nil {
-		details.defaultReasonCode = routeReasonRangeCacheMiss
-		return nil, details
+		return nil
 	}
-	return r.finder.fillCommitRoutingHintWithExclusionsAndDetails(ctx, req, excludedEndpoints)
+	return r.finder.fillCommitRoutingHintWithCooldownTracker(ctx, req, cooldowns)
 }
 
 func (r *locationRouter) observePartialResultSet(prs *sppb.PartialResultSet) {
